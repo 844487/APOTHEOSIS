@@ -3,6 +3,9 @@
 // GPLv3 License
 // reverseame@unizar.es
 
+// FIXME
+use crate::datalayer::record::RadixKeyMapping;
+
 use crate::controllers::hnsw::Hnsw;
 use crate::controllers::radix_tree::RadixNode;
 use crate::datalayer::algorithms::DistanceAlgorithm;

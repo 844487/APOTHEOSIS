@@ -53,6 +53,54 @@ impl<const N: usize> PartialEq for HnswNode<N> {
 
 impl<const N: usize> Eq for HnswNode<N> {}
 
+// A node in the NSG data structure
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NsgNode<const N: usize> {
+    pub feature_index: u32, // Pointer to the data associated to this node
+    #[serde(with = "serde_array")]
+    pub neighbors: [u32; N],
+    #[serde(with = "serde_array")]
+    pub neighbor_distances: [u32; N],
+    pub neighbor_count: u16,
+}
+
+impl<const N: usize> NsgNode<N> {
+    pub fn new_empty(feature_index: u32) -> Self {
+        Self {
+            feature_index,
+            neighbors: [u32::MAX; N],
+            neighbor_distances: [u32::MAX; N],
+            neighbor_count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn active_neighbors(&self) -> &[u32] {
+        &self.neighbors[..self.neighbor_count as usize]
+    }
+
+    #[inline]
+    pub fn active_distances(&self) -> &[u32] {
+        &self.neighbor_distances[..self.neighbor_count as usize]
+    }
+}
+
+impl<const N: usize> Hash for NsgNode<N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.feature_index.hash(state);
+        self.neighbor_count.hash(state);
+    }
+}
+
+impl<const N: usize> PartialEq for NsgNode<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.feature_index == other.feature_index
+            && self.neighbor_count == other.neighbor_count
+    }
+}
+
+impl<const N: usize> Eq for NsgNode<N> {}
+
 // Helper module for serializing and deserializing const-generic arrays
 // Serde does not support const-generic arrays directly so we need to do this garbage
 mod serde_array {
