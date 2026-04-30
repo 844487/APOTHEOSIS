@@ -13,11 +13,13 @@ impl DistanceAlgorithm<Vec<f32>> for L2Distance {
 }
 
 fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let nsg_path   = std::env::args().nth(1).expect("usage: test_nsg <graph.nsg> <data.fvecs>");
     let fvecs_path = std::env::args().nth(2).expect("usage: test_nsg <graph.nsg> <data.fvecs>");
 
     println!("Loading...");
-    let nsg = Nsg::<L2Distance, Vec<f32>, 100, 100>::from_knn_graph_features(
+    let nsg = Nsg::<L2Distance, Vec<f32>, 500, 500>::from_nn_graph(
         &nsg_path,
         &fvecs_path,
         L2Distance,

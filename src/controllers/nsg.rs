@@ -67,50 +67,66 @@ where
     }
 
     // TODO: Again, provisional
-    pub fn from_knn_graph_features(nsg_path: &str, fvecs_path: &str, distance: D) -> std::io::Result<Self>
-    where
-        ID: From<Vec<f32>>,
-    {
-        use std::io::Read;
-    
-        let features: Vec<ID> = Self::load_fvecs(fvecs_path)?
-            .into_iter()
-            .map(ID::from)
-            .collect();
-    
-        let mut file = std::fs::File::open(nsg_path)?;
-        let mut buf4 = [0u8; 4];
-    
-        file.read_exact(&mut buf4)?;
-        let _width = u32::from_le_bytes(buf4);
-    
-        file.read_exact(&mut buf4)?;
-        let ep = u32::from_le_bytes(buf4);
-    
-        let mut nnd_graph: Vec<NsgNode<M>> = Vec::new();
-        loop {
-            if file.read_exact(&mut buf4).is_err() { break; }
-            let k = u32::from_le_bytes(buf4) as usize;
-    
-            let mut node = NsgNode::new_empty(nnd_graph.len() as u32);
-            node.neighbor_count = k.min(M) as u16;
-    
-            for i in 0..k {
-                file.read_exact(&mut buf4)?;
-                let nb = u32::from_le_bytes(buf4);
-                if i < M { node.neighbors[i] = nb; }
-            }
-            nnd_graph.push(node);
+    pub fn load_nn_graph(path: &str) -> std::io::Result<Vec<NsgNode<M>>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buf4 = [0u8; 4];
+
+    // First 4 bytes = K (same for all nodes)
+    file.read_exact(&mut buf4)?;
+    let k = u32::from_le_bytes(buf4) as usize;
+    debug!("KNN graph K={k}");
+
+    // Seek back — each node repeats its own k
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut nnd_graph: Vec<NsgNode<M>> = Vec::new();
+    loop {
+        if file.read_exact(&mut buf4).is_err() { break; }
+        let node_k = u32::from_le_bytes(buf4) as usize;
+
+        let mut node = NsgNode::new_empty(nnd_graph.len() as u32);
+        node.neighbor_count = node_k.min(M) as u16;
+
+        for i in 0..node_k {
+            file.read_exact(&mut buf4)?;
+            let nb = u32::from_le_bytes(buf4);
+            if i < M { node.neighbors[i] = nb; }
         }
-    
-        Ok(Self {
-            features,
-            nnd_graph,
-            navigating_node: ep as usize,
-            prng: StdRng::seed_from_u64(42),
-            distance,
-        })
+        debug!(
+            "node {}: {} neighbors → {:?}",
+            nnd_graph.len(),
+            node.neighbor_count,
+            &node.neighbors[..node.neighbor_count as usize]
+        );
+        nnd_graph.push(node);
     }
+
+    Ok(nnd_graph)
+}
+
+pub fn from_nn_graph(nn_graph_path: &str, fvecs_path: &str, distance: D) -> std::io::Result<Self>
+where
+    ID: From<Vec<f32>>,
+{
+    debug!("Before reading features");
+    let features: Vec<ID> = Self::load_fvecs(fvecs_path)?
+        .into_iter()
+        .map(ID::from)
+        .collect();
+
+    let nnd_graph = Self::load_nn_graph(nn_graph_path)?;
+
+    Ok(Self {
+        features,
+        nnd_graph,
+        navigating_node: usize::MAX, // We will have to compute this later
+        prng: StdRng::seed_from_u64(42),
+        distance,
+    })
+}
 
     pub fn knn_search_exhaustive(&self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize)> {
         let mut visited_neighbors: HashSet<usize> = HashSet::new();
