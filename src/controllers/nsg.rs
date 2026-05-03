@@ -68,65 +68,65 @@ where
 
     // TODO: Again, provisional
     pub fn load_nn_graph(path: &str) -> std::io::Result<Vec<NsgNode<M>>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut buf4 = [0u8; 4];
-
-    // First 4 bytes = K (same for all nodes)
-    file.read_exact(&mut buf4)?;
-    let k = u32::from_le_bytes(buf4) as usize;
-    debug!("KNN graph K={k}");
-
-    // Seek back — each node repeats its own k
-    use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(0))?;
-
-    let mut nnd_graph: Vec<NsgNode<M>> = Vec::new();
-    loop {
-        if file.read_exact(&mut buf4).is_err() { break; }
-        let node_k = u32::from_le_bytes(buf4) as usize;
-
-        let mut node = NsgNode::new_empty(nnd_graph.len() as u32);
-        node.neighbor_count = node_k.min(M) as u16;
-
-        for i in 0..node_k {
-            file.read_exact(&mut buf4)?;
-            let nb = u32::from_le_bytes(buf4);
-            if i < M { node.neighbors[i] = nb; }
+        use std::io::Read;
+    
+        let mut file = std::fs::File::open(path)?;
+        let mut buf4 = [0u8; 4];
+    
+        // First 4 bytes = K (same for all nodes)
+        file.read_exact(&mut buf4)?;
+        let k = u32::from_le_bytes(buf4) as usize;
+        debug!("KNN graph K={k}");
+    
+        // Seek back — each node repeats its own k
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))?;
+    
+        let mut nnd_graph: Vec<NsgNode<M>> = Vec::new();
+        loop {
+            if file.read_exact(&mut buf4).is_err() { break; }
+            let node_k = u32::from_le_bytes(buf4) as usize;
+    
+            let mut node = NsgNode::new_empty(nnd_graph.len() as u32);
+            node.neighbor_count = node_k.min(M) as u16;
+    
+            for i in 0..node_k {
+                file.read_exact(&mut buf4)?;
+                let nb = u32::from_le_bytes(buf4);
+                if i < M { node.neighbors[i] = nb; }
+            }
+            debug!(
+                "node {}: {} neighbors → {:?}",
+                nnd_graph.len(),
+                node.neighbor_count,
+                &node.neighbors[..node.neighbor_count as usize]
+            );
+            nnd_graph.push(node);
         }
-        debug!(
-            "node {}: {} neighbors → {:?}",
-            nnd_graph.len(),
-            node.neighbor_count,
-            &node.neighbors[..node.neighbor_count as usize]
-        );
-        nnd_graph.push(node);
+    
+        Ok(nnd_graph)
     }
 
-    Ok(nnd_graph)
-}
-
-pub fn from_nn_graph(nn_graph_path: &str, fvecs_path: &str, distance: D) -> std::io::Result<Self>
-where
-    ID: From<Vec<f32>>,
-{
-    debug!("Before reading features");
-    let features: Vec<ID> = Self::load_fvecs(fvecs_path)?
-        .into_iter()
-        .map(ID::from)
-        .collect();
-
-    let nnd_graph = Self::load_nn_graph(nn_graph_path)?;
-
-    Ok(Self {
-        features,
-        nnd_graph,
-        navigating_node: usize::MAX, // We will have to compute this later
-        prng: StdRng::seed_from_u64(42),
-        distance,
-    })
-}
+    pub fn from_nn_graph(nn_graph_path: &str, fvecs_path: &str, distance: D) -> std::io::Result<Self>
+    where
+        ID: From<Vec<f32>>,
+    {
+        debug!("Before reading features");
+        let features: Vec<ID> = Self::load_fvecs(fvecs_path)?
+            .into_iter()
+            .map(ID::from)
+            .collect();
+    
+        let nnd_graph = Self::load_nn_graph(nn_graph_path)?;
+    
+        Ok(Self {
+            features,
+            nnd_graph,
+            navigating_node: usize::MAX, // We will have to compute this later
+            prng: StdRng::seed_from_u64(42),
+            distance,
+        })
+    }
 
     pub fn knn_search_exhaustive(&self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize)> {
         let mut visited_neighbors: HashSet<usize> = HashSet::new();
@@ -178,6 +178,99 @@ where
         let n = self.features.len();
         self.prng.next_u64() as usize % n
     }
+
+    fn get_neighbors(
+        &mut self,
+        query_id: &ID,
+        ef: usize,
+    ) -> (Vec<(usize, u32)>, Vec<(usize, u32)>) {
+        let mut visited_neighbors: HashSet<usize> = HashSet::new();
+        // TODO: Insert enter_point?
+
+        let mut knn_neighbors: Vec<(usize, u32, bool)> = Vec::with_capacity(ef + 1);
+
+        // (idx, score) de todos los nodos visitados
+        let mut fullset: Vec<(usize, u32)> = Vec::new();
+    
+        let enter_point = self.navigating_node as usize;
+        for neighbor in self.nnd_graph[enter_point].active_neighbors() {
+            if knn_neighbors.len() >= ef {
+                break;
+            }
+
+            let neighbor_feature_index = *neighbor as usize;
+            visited_neighbors.insert(neighbor_feature_index);
+            let score = self
+                .distance
+                .calculate_distance(&self.features[neighbor_feature_index], query_id);
+            let pos = knn_neighbors.partition_point(|n| n.1 <= score);
+            knn_neighbors.insert(pos, (neighbor_feature_index, score, true));
+            fullset.push((neighbor_feature_index, score));
+        }
+    
+        while knn_neighbors.len() < ef {
+            let neighbor_feature_index = self.random_node();
+            if visited_neighbors.insert(neighbor_feature_index) {
+                let score = self
+                    .distance
+                    .calculate_distance(&self.features[neighbor_feature_index], query_id);
+                let pos = knn_neighbors.partition_point(|n| n.1 <= score);
+                knn_neighbors.insert(pos, (neighbor_feature_index, score, true));
+                fullset.push((neighbor_feature_index, score));
+            }
+        }
+    
+        // Greedy best-first search
+        let mut current_neighbor_to_expand = 0;
+        while current_neighbor_to_expand < ef {
+            let mut earliest_insertion = ef;
+            let (candidate, _, needs_expansion) = knn_neighbors[current_neighbor_to_expand];
+            if needs_expansion {
+                knn_neighbors[current_neighbor_to_expand].2 = false;
+                for neighbor in self.nnd_graph[candidate].active_neighbors() {
+                    let neighbor_feature_index = *neighbor as usize;
+                    if visited_neighbors.insert(neighbor_feature_index) {
+                        let score = self
+                            .distance
+                            .calculate_distance(&self.features[neighbor_feature_index], query_id);
+                        fullset.push((neighbor_feature_index, score));
+
+                        if score < knn_neighbors[ef - 1].1 {
+                            let pos = knn_neighbors.partition_point(|n| n.1 <= score);
+                            if pos != ef {
+                                if knn_neighbors.len() == ef {
+                                    knn_neighbors.pop();
+                                }
+                                knn_neighbors.insert(pos, (neighbor_feature_index, score, true));
+
+                                if pos < earliest_insertion {
+                                    earliest_insertion = pos;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if earliest_insertion <= current_neighbor_to_expand {
+                current_neighbor_to_expand = earliest_insertion;
+            } else {
+                current_neighbor_to_expand += 1;
+            }
+        }
+    
+        let retset = knn_neighbors
+            .into_iter()
+            .map(|(i, d, _)| (i, d)).
+            collect();
+
+        (retset, fullset)
+    }
+
+
+
+
+
 
     pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize)> {
         let mut visited_neighbors: HashSet<usize> = HashSet::new();
