@@ -31,6 +31,8 @@ impl DistanceAlgorithm<Vec<f32>> for L2Distance {
     }
 }
 
+// TODO: Try to treat the centroid as the query, search on the kNN graph
+// and take the returned nearest neighbor as the approximate medoid
 pub trait Centroid: Sized + Clone {
     fn centroid(features: &[Self]) -> Self;
 }

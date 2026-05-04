@@ -13,12 +13,15 @@ fn default_rng() -> StdRng {
     StdRng::seed_from_u64(42)
 }
 
+// M: max out-degree
+// C: max candidates considered in sync prune
+// EF: candidate pool size for greedy search
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(bound(
     serialize = "ID: serde::Serialize, D: DistanceAlgorithm<ID> + serde::Serialize",
     deserialize = "ID: serde::Deserialize<'de>, D: DistanceAlgorithm<ID> + serde::Deserialize<'de>"
 ))]
-pub struct Nsg<D, ID, const M: usize, const EF: usize = 400>
+pub struct Nsg<D, ID, const M: usize, const C: usize, const EF: usize = 400>
 where
     D: DistanceAlgorithm<ID> + Default,
 {
@@ -30,7 +33,7 @@ where
     distance: D,
 }
 
-impl<D, ID, const M: usize, const EF: usize> Nsg<D, ID, M, EF>
+impl<D, ID, const M: usize, const C: usize, const EF: usize> Nsg<D, ID, M, C, EF>
 where
     D: DistanceAlgorithm<ID> + Default,
 {
@@ -267,7 +270,55 @@ where
         (retset, fullset)
     }
 
+    fn sync_prune(&self, node: usize, candidates: &mut Vec<(usize, u32)>) -> Vec<(usize, u32)> {
+        for neighbor in self.nnd_graph[node].active_neighbors() {
+            let neighbor_feature_index = *neighbor as usize;
+            if candidates.iter().any(|(idx, _)| *idx == neighbor_feature_index) {
+                continue;
+            }
+            
+            let score = self
+                .distance
+                .calculate_distance(&self.features[neighbor_feature_index], &self.features[node]);
 
+            candidates.push((neighbor_feature_index, score));
+        }
+
+        candidates.sort_unstable_by_key(|&(_, distance)| distance);
+
+        let mut selected: Vec<(usize, u32)> = Vec::with_capacity(M);
+        let mut start = 0;
+
+        // If node is the best candidate, we skip to the next best candidate
+        if candidates[start].0 == node {
+            start += 1;
+        }
+
+        selected.push(candidates[start]);
+
+        // For each next candidate p (ordered by distance to node), we accept it
+        // only if there is no neighbor r in selected such that dist(r, p) < dist(node, p)
+        // (we could reach p via r) [MRNG]
+        'outer: for i in (start + 1)..candidates.len().min(C) {
+            if selected.len() >= M {
+                break;
+            }
+
+            let (candidate_feature_index, candidate_score) = candidates[i];
+            for &(selected_feature_index, _) in &selected {
+                let distance_selected_to_candidate = self
+                    .distance
+                    .calculate_distance(&self.features[selected_feature_index], &self.features[candidate_feature_index]);
+
+                if distance_selected_to_candidate < candidate_score {
+                    continue 'outer
+                }
+            }
+            selected.push((candidate_feature_index, candidate_score));
+        }
+
+        selected
+    }
 
 
 
