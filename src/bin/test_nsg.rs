@@ -1,30 +1,17 @@
 // src/bin/test_nsg.rs
-use apotheosis2::datalayer::algorithms::DistanceAlgorithm;
+use apotheosis2::datalayer::algorithms::L2Distance;
 use apotheosis2::controllers::nsg::Nsg;
-
-// Provisional, I need to make sure NSG works properly
-#[derive(Default)]
-struct L2Distance;
-impl DistanceAlgorithm<Vec<f32>> for L2Distance {
-    fn calculate_distance(&self, a: &Vec<f32>, b: &Vec<f32>) -> u32 {
-        let dist: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
-        dist.sqrt() as u32
-    }
-}
 
 fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let nsg_path   = std::env::args().nth(1).expect("usage: test_nsg <graph.nsg> <data.fvecs>");
-    let fvecs_path = std::env::args().nth(2).expect("usage: test_nsg <graph.nsg> <data.fvecs>");
+    let nn_graph_path = std::env::args().nth(1).expect("usage: test_nsg <nn_graph> <data.fvecs>");
+    let fvecs_path    = std::env::args().nth(2).expect("usage: test_nsg <nn_graph> <data.fvecs>");
 
-    println!("Loading...");
-    let nsg = Nsg::<L2Distance, Vec<f32>, 500, 500>::from_nn_graph(
-        &nsg_path,
-        &fvecs_path,
-        L2Distance,
-    )?;
+    println!("Building NSG...");
+    let mut nsg = Nsg::<L2Distance, Vec<f32>, 500, 500>::new();
+    nsg.build(&nn_graph_path, &fvecs_path)?;
+    println!("Done!");
 
-    println!("Loaded!");
     Ok(())
 }

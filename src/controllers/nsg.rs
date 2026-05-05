@@ -101,12 +101,12 @@ where
                 let nb = u32::from_le_bytes(buf4);
                 if i < M { node.neighbors[i] = nb; }
             }
-            debug!(
-                "node {}: {} neighbors → {:?}",
-                nnd_graph.len(),
-                node.neighbor_count,
-                &node.neighbors[..node.neighbor_count as usize]
-            );
+            // debug!(
+            //     "node {}: {} neighbors → {:?}",
+            //     nnd_graph.len(),
+            //     node.neighbor_count,
+            //     &node.neighbors[..node.neighbor_count as usize]
+            // );
             nnd_graph.push(node);
         }
     
@@ -117,7 +117,6 @@ where
     where
         ID: From<Vec<f32>>,
     {
-        debug!("Before reading features");
         let features: Vec<ID> = Self::load_fvecs(fvecs_path)?
             .into_iter()
             .map(ID::from)
@@ -277,9 +276,9 @@ where
     where
         ID: Centroid,
     {
-        let n = self.features.len();
         let center = ID::centroid(&self.features);
         self.navigating_node = self.random_node();
+        debug!("init_graph: random entry point → {}", self.navigating_node);
         let results = self.knn_search(&center, 1, EF);
         if let Some(&(_, idx)) = results.first() {
             self.navigating_node = idx;
@@ -391,6 +390,7 @@ where
     fn link(&mut self) {
         let n = self.features.len();
         let mut cut_graph: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n]; 
+        debug!("link: building NSG edges for {} nodes", n);
 
         for node in 0..n {
             let node_feature = self.features[node].clone();
@@ -398,9 +398,12 @@ where
             let selected = self.sync_prune(node, &mut fullset);
             cut_graph[node] = selected.clone();
             self.inter_insert(node, &selected, &mut cut_graph);
+
+            debug!("link: processed {}/{} nodes", node, n);
         }
 
         // Write cut_graph back into nnd_graph
+        debug!("link: writing edges back into nnd_graph");
         for node in 0..n {
             let selected = &cut_graph[node];
             let node_entry = &mut self.nnd_graph[node];
@@ -419,14 +422,19 @@ where
         let mut flags = vec![false; n];
         let mut root = self.navigating_node;
         let mut unlinked_count = 0;
+        debug!("tree_grow: checking connectivity from navigating_node={}", self.navigating_node);
 
         while unlinked_count < n {
             self.dfs(&mut flags, root, &mut unlinked_count);
+            debug!("tree_grow: {}/{} nodes reachable", unlinked_count, n);
             if unlinked_count >= n {
                 break;
             }
             root = self.find_root(&mut flags);
+            debug!("tree_grow: new root → {}", root);
         }
+
+        debug!("tree_grow: all {} nodes connected", n);
 
         // TODO: In NSG, they update the width of the graph (M)...
     }
@@ -466,6 +474,7 @@ where
             Some(idx) => idx, 
             None => return self.navigating_node, // All linked
         };
+        debug!("find_root: connecting unlinked node {}", unlinked_node);
 
         let unlinked_node_feature = self.features[unlinked_node].clone();
         let (_, mut fullset) = self.get_neighbors(&unlinked_node_feature, EF);
@@ -480,6 +489,8 @@ where
                     break r;
                 }
             });
+
+        debug!("find_root: linking {} → {}", root, unlinked_node);
 
         let distance = self
             .distance
@@ -508,21 +519,30 @@ where
         // TODO: Get rid of this Vec<f32>
         ID: From<Vec<f32>> + Clone + Centroid,
     {
+        debug!("build: loading features from {}", fvecs_path);
         self.features = Self::load_fvecs(fvecs_path)? 
             .into_iter()
             .map(ID::from)
             .collect();
+        debug!("build: loaded {} features", self.features.len());
 
+        debug!("build: loading KNN graph from {}", nn_graph_path);
         self.nnd_graph = Self::load_nn_graph(nn_graph_path)?;
+        debug!("build: loaded {} nodes", self.nnd_graph.len());
 
+        debug!("build: computing navigating node");
         self.init_graph();
+
+        debug!("build: linking graph (sync_prune + inter_insert)");
         self.link();
+
+        debug!("build: ensuring full connectivity");
         self.tree_grow();
 
         let max = self.nnd_graph.iter().map(|n| n.neighbor_count).max().unwrap_or(0);
         let min = self.nnd_graph.iter().map(|n| n.neighbor_count).min().unwrap_or(0);
         let avg = self.nnd_graph.iter().map(|n| n.neighbor_count as usize).sum::<usize>() / self.nnd_graph.len();
-        debug!("Degree Statistics: Max={max}, Min={min}, Avg={avg}");
+        debug!("build: done — degree stats: max={max}, min={min}, avg={avg}");
 
         Ok(())
     }

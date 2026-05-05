@@ -23,7 +23,7 @@ impl DistanceAlgorithm<TlshDefault> for TlshDistance {
 
 // Provisional, I need to make sure NSG works properly
 #[derive(Default)]
-struct L2Distance;
+pub struct L2Distance;
 impl DistanceAlgorithm<Vec<f32>> for L2Distance {
     fn calculate_distance(&self, a: &Vec<f32>, b: &Vec<f32>) -> u32 {
         let dist: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
