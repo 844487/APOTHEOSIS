@@ -1,4 +1,5 @@
 use crate::datalayer::algorithms::DistanceAlgorithm;
+use crate::datalayer::algorithms::Centroid;
 use crate::datalayer::nodes::NsgNode;
 use core::cmp::min;
 use std::thread::current;
@@ -272,6 +273,20 @@ where
         (retset, fullset)
     }
 
+    fn init_graph(&mut self)
+    where
+        ID: Centroid,
+    {
+        let n = self.features.len();
+        let center = ID::centroid(&self.features);
+        self.navigating_node = self.random_node();
+        let results = self.knn_search(&center, 1, EF);
+        if let Some(&(_, idx)) = results.first() {
+            self.navigating_node = idx;
+        }
+        debug!("init_graph: navigating_node -> {}", self.navigating_node);
+    }
+
     fn sync_prune(&self, node: usize, candidates: &mut Vec<(usize, u32)>) -> Vec<(usize, u32)> {
         for neighbor in self.nnd_graph[node].active_neighbors() {
             let neighbor_feature_index = *neighbor as usize;
@@ -381,8 +396,8 @@ where
             let node_feature = self.features[node].clone();
             let (_, mut fullset) = self.get_neighbors(&node_feature, EF);
             let selected = self.sync_prune(node, &mut fullset);
+            cut_graph[node] = selected.clone();
             self.inter_insert(node, &selected, &mut cut_graph);
-            cut_graph[node] = selected;
         }
 
         // Write cut_graph back into nnd_graph
@@ -398,9 +413,119 @@ where
         }
     }
 
+    fn tree_grow(&mut self) {
+        let n = self.features.len();
+        // Stores if a node is reachable from the root in the DFS tree
+        let mut flags = vec![false; n];
+        let mut root = self.navigating_node;
+        let mut unlinked_count = 0;
 
+        while unlinked_count < n {
+            self.dfs(&mut flags, root, &mut unlinked_count);
+            if unlinked_count >= n {
+                break;
+            }
+            root = self.find_root(&mut flags);
+        }
 
+        // TODO: In NSG, they update the width of the graph (M)...
+    }
 
+    fn dfs(&self, flags: &mut Vec<bool>, root: usize, count: &mut usize) {
+        let mut stack = vec![root];
+        if !flags[root] {
+            *count += 1;
+        }
+        flags[root] = true;
+
+        while let Some(node) = stack.last().copied() {
+            let next = self.nnd_graph[node].active_neighbors()
+                .iter()
+                .map(|&neighbor| neighbor as usize)
+                .find(|&neighbor| !flags[neighbor]);
+
+            match next {
+                Some(neighbor) => {
+                    flags[neighbor] = true;
+                    *count += 1;
+                    stack.push(neighbor);
+                }
+                None => {
+                    // All neighbors have already been visited in the search
+                    stack.pop();
+                }
+            }
+        }
+    }
+
+    fn find_root(&mut self, flags: &mut Vec<bool>) -> usize {
+        let n = self.features.len();
+
+        // Find fist unlinked node
+        let unlinked_node = match flags.iter().position(|&flag| !flag) {
+            Some(idx) => idx, 
+            None => return self.navigating_node, // All linked
+        };
+
+        let unlinked_node_feature = self.features[unlinked_node].clone();
+        let (_, mut fullset) = self.get_neighbors(&unlinked_node_feature, EF);
+        fullset.sort_unstable_by_key(|&(_, distance)| distance);
+
+        let root = fullset.iter()
+            .find(|&&(idx, _)| flags[idx])
+            .map(|&(idx, _)| idx)
+            .unwrap_or_else(|| loop {
+                let r = self.random_node();
+                if flags[r] {
+                    break r;
+                }
+            });
+
+        let distance = self
+            .distance
+            .calculate_distance(&self.features[root], &self.features[unlinked_node]);
+
+        let node = &mut self.nnd_graph[root];
+        let count = node.neighbor_count as usize;
+        if count < M {
+            node.neighbors[count] = unlinked_node as u32;
+            node.neighbor_distances[count] = distance;
+            node.neighbor_count += 1;
+        } else if let Some(position) = node.neighbor_distances[..count]
+            .iter().enumerate()
+            .max_by_key(|&(_, &distance)| distance)
+            .map(|(idx, _)| idx)
+        {
+            node.neighbors[position] = unlinked_node as u32;
+            node.neighbor_distances[position] = distance;
+        }
+
+        root
+    }
+
+    pub fn build(&mut self, nn_graph_path: &str, fvecs_path: &str) -> std::io::Result<()>
+    where 
+        // TODO: Get rid of this Vec<f32>
+        ID: From<Vec<f32>> + Clone + Centroid,
+    {
+        self.features = Self::load_fvecs(fvecs_path)? 
+            .into_iter()
+            .map(ID::from)
+            .collect();
+
+        self.nnd_graph = Self::load_nn_graph(nn_graph_path)?;
+
+        self.init_graph();
+        self.link();
+        self.tree_grow();
+
+        let max = self.nnd_graph.iter().map(|n| n.neighbor_count).max().unwrap_or(0);
+        let min = self.nnd_graph.iter().map(|n| n.neighbor_count).min().unwrap_or(0);
+        let avg = self.nnd_graph.iter().map(|n| n.neighbor_count as usize).sum::<usize>() / self.nnd_graph.len();
+        debug!("Degree Statistics: Max={max}, Min={min}, Avg={avg}");
+
+        Ok(())
+    }
 
     pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize)> {
         let mut visited_neighbors: HashSet<usize> = HashSet::new();
