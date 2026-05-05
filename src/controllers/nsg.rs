@@ -23,6 +23,7 @@ fn default_rng() -> StdRng {
 ))]
 pub struct Nsg<D, ID, const M: usize, const C: usize, const EF: usize = 400>
 where
+    ID: Clone,
     D: DistanceAlgorithm<ID> + Default,
 {
     features: Vec<ID>,
@@ -35,6 +36,7 @@ where
 
 impl<D, ID, const M: usize, const C: usize, const EF: usize> Nsg<D, ID, M, C, EF>
 where
+    ID: Clone,
     D: DistanceAlgorithm<ID> + Default,
 {
     pub fn new() -> Self {
@@ -319,6 +321,83 @@ where
 
         selected
     }
+
+    // selected is the result of calling sync_prune for node
+    // cut_graph is a temporal graph
+    // for every edge [node -> neighbor], it adds the edge [neighbor -> node]
+    fn inter_insert(&self, node: usize, selected: &Vec<(usize, u32)>, cut_graph: &mut Vec<Vec<(usize, u32)>>) {
+        for &(neighbor, distance) in selected {
+            let neighbor_pool = &cut_graph[neighbor]; 
+
+            // node is already a neighbor
+            if neighbor_pool.iter().any(|&(idx, _)| idx == node) {
+                continue;
+            }
+
+            let mut temp_pool = neighbor_pool.clone();
+
+            // Add node as a neighbor
+            temp_pool.push((node, distance));
+
+            // [neighbor] now has more than M neighbors, we apply MRNG again to
+            // the neighbors of [neighbor] + node, keeping the M best ones
+            if temp_pool.len() > M {
+                // TODO: Is this less expensive than inserting node in the right position?
+                temp_pool.sort_unstable_by_key(|&(_, distance)| distance);
+
+                let mut selected: Vec<(usize, u32)> = Vec::with_capacity(M);
+                let start = 0;
+                selected.push(temp_pool[start]);
+
+                'outer: for i in (start + 1)..temp_pool.len().min(C) {
+                    if selected.len() >= M {
+                        break;
+                    }
+
+                    let (candidate_feature_index, candidate_score) = temp_pool[i];
+                    for &(selected_feature_index, _) in &selected {
+                        let distance_selected_to_candidate = self
+                            .distance
+                            .calculate_distance(&self.features[selected_feature_index], &self.features[candidate_feature_index]);
+
+                        if distance_selected_to_candidate < candidate_score {
+                            continue 'outer
+                        }
+                    }
+                    selected.push((candidate_feature_index, candidate_score));
+                }
+                cut_graph[neighbor] = selected;
+            } else {
+                cut_graph[neighbor] = temp_pool;
+            }
+        }    
+    }
+
+    fn link(&mut self) {
+        let n = self.features.len();
+        let mut cut_graph: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n]; 
+
+        for node in 0..n {
+            let node_feature = self.features[node].clone();
+            let (_, mut fullset) = self.get_neighbors(&node_feature, EF);
+            let selected = self.sync_prune(node, &mut fullset);
+            self.inter_insert(node, &selected, &mut cut_graph);
+            cut_graph[node] = selected;
+        }
+
+        // Write cut_graph back into nnd_graph
+        for node in 0..n {
+            let selected = &cut_graph[node];
+            let node_entry = &mut self.nnd_graph[node];
+
+            node_entry.neighbor_count = selected.len() as u16;
+            for (i, &(neighbor_feature_index, neighbor_distance)) in selected.iter().enumerate() {
+                node_entry.neighbors[i] = neighbor_feature_index as u32;
+                node_entry.neighbor_distances[i] = neighbor_distance;
+            }
+        }
+    }
+
 
 
 
