@@ -50,6 +50,11 @@ where
         }
     }
 
+    // TODO: This is provisional
+    pub fn set_features(&mut self, features: Vec<ID>) {
+        self.features = features;
+    }
+
     // TODO: Provisional, just to work like NSG
     pub fn load_fvecs(path: &str) -> std::io::Result<Vec<Vec<f32>>> {
         use std::io::Read;
@@ -413,6 +418,14 @@ where
                 node_entry.neighbors[i] = neighbor_feature_index as u32;
                 node_entry.neighbor_distances[i] = neighbor_distance;
             }
+
+            debug!(
+                "node {}: {} neighbors → {:?}",
+                node,
+                node_entry.neighbor_count,
+                &node_entry.neighbors[..node_entry.neighbor_count as usize]
+            );
+
         }
     }
 
@@ -628,5 +641,69 @@ where
             .take(k)
             .map(|(index, distance, _)| (distance, index))
             .collect()
+    }
+
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+    
+        let mut file = std::fs::File::create(path)?;
+        let mut buf4 = [0u8; 4];
+    
+        // width (M)
+        buf4 = (M as u32).to_le_bytes();
+        file.write_all(&buf4)?;
+    
+        // navigating_node (ep_)
+        buf4 = (self.navigating_node as u32).to_le_bytes();
+        file.write_all(&buf4)?;
+    
+        // for each node: k + neighbors
+        for node in &self.nnd_graph {
+            buf4 = (node.neighbor_count as u32).to_le_bytes();
+            file.write_all(&buf4)?;
+            for &nb in node.active_neighbors() {
+                file.write_all(&nb.to_le_bytes())?;
+            }
+        }
+    
+        debug!("save: wrote {} nodes to {}", self.nnd_graph.len(), path);
+        Ok(())
+    }
+    
+    pub fn load(&mut self, path: &str) -> std::io::Result<()> {
+        use std::io::Read;
+    
+        let mut file = std::fs::File::open(path)?;
+        let mut buf4 = [0u8; 4];
+    
+        file.read_exact(&mut buf4)?;
+        let width = u32::from_le_bytes(buf4) as usize;
+        debug!("load: width={width}");
+        if width != M {
+            debug!("load: warning — graph was built with M={width}, loading into M={M}");
+        }
+    
+        file.read_exact(&mut buf4)?;
+        self.navigating_node = u32::from_le_bytes(buf4) as usize;
+        debug!("load: navigating_node={}", self.navigating_node);
+    
+        self.nnd_graph.clear();
+        loop {
+            if file.read_exact(&mut buf4).is_err() { break; }
+            let k = u32::from_le_bytes(buf4) as usize;
+    
+            let mut node = NsgNode::new_empty(self.nnd_graph.len() as u32);
+            node.neighbor_count = k.min(M) as u16;
+    
+            for i in 0..k {
+                file.read_exact(&mut buf4)?;
+                let nb = u32::from_le_bytes(buf4);
+                if i < M { node.neighbors[i] = nb; }
+            }
+            self.nnd_graph.push(node);
+        }
+    
+        debug!("load: loaded {} nodes", self.nnd_graph.len());
+        Ok(())
     }
 }
