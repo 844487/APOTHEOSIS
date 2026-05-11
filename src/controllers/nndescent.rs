@@ -1,0 +1,273 @@
+use crate::datalayer::algorithms::DistanceAlgorithm;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
+use tracing::debug;
+
+fn default_rng() -> StdRng {
+    StdRng::seed_from_u64(42)
+}
+
+// K: number of final neighbors per node
+// L: candidate pool size per node
+// S: number of initial random neighbors
+// R: max reverse neighbors size
+pub struct Nhood {
+    // pool: (idx, dist, is_new)
+    // is_new=true if neighbor was added in this iteration
+    pub pool: Vec<(usize, u32, bool)>,
+    pub nn_new: Vec<usize>, // new added candidate neighbors
+    pub nn_old: Vec<usize>, // old candidate neighbors at previous iterations
+    pub rnn_new: Vec<usize>, // new added erverse candidate neighbors
+    pub rnn_old: Vec<usize>, // old reverse candidate neighbors
+    pub m: usize, // index of the last active neighbor ??
+}
+
+pub struct NNDescent<D, ID, const K: usize, const L: usize, const S: usize, const R: usize>
+where
+    D: DistanceAlgorithm<ID> + Default,
+    ID: Clone,
+{
+    features: Vec<ID>,
+    graph: Vec<Nhood>,
+    distance: D,
+    prng: StdRng,
+}
+
+impl<D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<D, ID, K, L, S, R>
+where
+    D: DistanceAlgorithm<ID> + Default,
+    ID: Clone,
+{
+    pub fn new(features: Vec<ID>) -> Self {
+        let n = features.len();
+        Self {
+            features,
+            graph: Vec::with_capacity(n),
+            distance: D::default(),
+            prng: StdRng::seed_from_u64(42),
+        }
+    }
+
+    #[inline]
+    fn random_node(&mut self) -> usize {
+        let n = self.features.len();
+        self.prng.next_u64() as usize % n
+    }
+
+    fn initialize_graph(&mut self) {
+        let n = self.features.len();
+        self.graph.clear();
+
+        for i in 0..n {
+            // S random neighbors
+            let mut nn_new: Vec<usize> = Vec::with_capacity(S);
+            while nn_new.len() < S {
+                let r = self.random_node();
+                if r != i && !nn_new.contains(&r) {
+                    nn_new.push(r);
+                }
+            }
+
+            // Compute distances and fill pool
+            let pool: Vec<(usize, u32, bool)> = nn_new.iter().map(|&nb| {
+                let dist = self
+                    .distance
+                    .calculate_distance(&self.features[i], &self.features[nb]);
+                (nb, dist, true)
+            }).collect();
+
+            self.graph.push(Nhood {
+                pool,
+                nn_new,
+                nn_old: Vec::new(),
+                rnn_new: Vec::new(),
+                rnn_old: Vec::new(),
+                m: 0,
+            });
+        }
+
+        debug!("initialize_graph: {} nodes initialized with S={S} random neighbors", n);
+    }
+
+    fn insert(&mut self, node: usize, neighbor: usize, distance: u32) {
+        let pool = &mut self.graph[node].pool;
+    
+        // Already in the pool
+        if pool.iter().any(|&(idx, _, _)| idx == neighbor) { return; }
+    
+        let pos = pool.partition_point(|&(_, d, _)| d <= distance);
+    
+        if pool.len() < L {
+            pool.insert(pos, (neighbor, distance, true));
+        } else if pos < L {
+            pool.pop();
+            pool.insert(pos, (neighbor, distance, true));
+        }
+    }
+
+    fn join(&mut self) {
+        let n = self.features.len();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+
+        for node in 0..n {
+            let nn_new = &self.graph[node].nn_new;
+            let nn_old = &self.graph[node].nn_old;
+
+            for &i in nn_new {
+                for &j in nn_new {
+                    if i < j  {
+                        pairs.push((i, j));
+                    }
+                }
+
+                for &j in nn_old {
+                    if i != j {
+                        pairs.push((i, j));
+                    }
+                }
+            }
+        }
+
+        for (i, j) in pairs {
+            let distance = self
+                .distance
+                .calculate_distance(&self.features[i], &self.features[j]);
+            self.insert(i, j, distance);
+            self.insert(j, i, distance);
+        }
+    }
+
+    fn update(&mut self) {
+        let n = self.features.len();
+    
+        // Clear nn_new/nn_old
+        for node in 0..n {
+            self.graph[node].nn_new.clear();
+            self.graph[node].nn_old.clear();
+        }
+    
+        for node in 0..n {
+            // TODO: Pool is already sorted. Maybe do not insert at partition
+            // point and then sort here?
+            self.graph[node].pool.truncate(L);
+    
+            // Advance until we have S new neighbors
+            let pool_len = self.graph[node].pool.len();
+            let maxl = (self.graph[node].m + S).min(pool_len);
+            let mut m = 0;
+            let mut new_count = 0;
+            while m < maxl && new_count < S {
+                if self.graph[node].pool[m].2 {
+                    new_count += 1;
+                }
+                m += 1;
+            }
+            self.graph[node].m = m;
+        }
+    
+        let mut rnn_new_updates: Vec<(usize, usize)> = Vec::new();
+        let mut rnn_old_updates: Vec<(usize, usize)> = Vec::new();
+    
+        // TODO: Parallelise this 
+        for node in 0..n {
+            let m = self.graph[node].m;
+            for l in 0..m {
+                let (neighbor_idx, neighbor_distance, is_new) = self.graph[node].pool[l];
+                let worst_distance_in_neighbor_pool = self.graph[neighbor_idx].pool.last().map_or(u32::MAX, |&(_, d, _)| d);
+    
+                if is_new {
+                    self.graph[node].nn_new.push(neighbor_idx);
+                    self.graph[node].pool[l].2 = false;
+                    // node distance to neighbor is worse than the the distance
+                    // of the worst element of the neighbor, it is a great
+                    // candidate
+                    if neighbor_distance > worst_distance_in_neighbor_pool {
+                        rnn_new_updates.push((neighbor_idx, node));
+                    }
+                } else {
+                    self.graph[node].nn_old.push(neighbor_idx);
+                    if neighbor_distance > worst_distance_in_neighbor_pool {
+                        rnn_old_updates.push((neighbor_idx, node));
+                    }
+                }
+            }
+        }
+    
+        // Apply reverse neighbor updates (promising candidates)
+        for (target, source) in rnn_new_updates {
+            if self.graph[target].rnn_new.len() < R {
+                self.graph[target].rnn_new.push(source);
+            } else {
+                // Reservoir sampling
+                let pos = self.prng.next_u64() as usize % R;
+                self.graph[target].rnn_new[pos] = source;
+            }
+        }
+    
+        for (target, source) in rnn_old_updates {
+            if self.graph[target].rnn_old.len() < R {
+                self.graph[target].rnn_old.push(source);
+            } else {
+                let pos = self.prng.next_u64() as usize % R;
+                self.graph[target].rnn_old[pos] = source;
+            }
+        }
+    
+        for node in 0..n {
+            let mut rnn_new = std::mem::take(&mut self.graph[node].rnn_new);
+            let mut rnn_old = std::mem::take(&mut self.graph[node].rnn_old);
+    
+            // TODO: Shuffle rnn. This should not be reached (it is the same
+            // in the C++ code)
+            if rnn_new.len() > R {
+                debug!("update: rnn_new exceeded R={R}, shuffling — this should not happen");
+                for i in 0..R {
+                    let j = i + self.prng.next_u64() as usize % (rnn_new.len() - i);
+                    rnn_new.swap(i, j);
+                }
+                rnn_new.truncate(R);
+            }
+            self.graph[node].nn_new.extend(rnn_new);
+    
+            if rnn_old.len() > R {
+                // Shuffle
+                for i in 0..R {
+                    let j = i + self.prng.next_u64() as usize % (rnn_old.len() - i);
+                    rnn_old.swap(i, j);
+                }
+                rnn_old.truncate(R);
+            }
+            self.graph[node].nn_old.extend(rnn_old);
+    
+            // Max size for old candidates is 2 * R
+            if self.graph[node].nn_old.len() > R * 2 {
+                self.graph[node].nn_old.truncate(R * 2);
+            }
+        }
+    }
+
+    pub fn build(&mut self, iter: usize) -> Vec<Vec<(usize, u32)>> {
+        let n = self.features.len();
+        debug!("build: initializing graph with {} nodes, K={K}, L={L}, S={S}, R={R}", n);
+        self.initialize_graph();
+    
+        for it in 0..iter {
+            debug!("build: iteration {}/{}", it + 1, iter);
+            self.join();
+            self.update();
+        }
+    
+        debug!("build: extracting K={K} best neighbors");
+        let mut final_graph: Vec<Vec<(usize, u32)>> = Vec::with_capacity(n);
+        for node in 0..n {
+            let neighbors = self.graph[node].pool.iter()
+                .take(K)
+                .map(|&(idx, dist, _)| (idx, dist))
+                .collect();
+            final_graph.push(neighbors);
+        }
+    
+        debug!("build: done");
+        final_graph
+    }
+}

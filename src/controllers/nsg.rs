@@ -40,6 +40,7 @@ where
     ID: Clone,
     D: DistanceAlgorithm<ID> + Default,
 {
+    // TODO: Add an initializer with the features
     pub fn new() -> Self {
         Self {
             features: vec![],
