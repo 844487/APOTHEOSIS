@@ -10,18 +10,19 @@ use tlsh2::TlshDefault;
 fn read_hashes_from_json<P: AsRef<std::path::Path>>(path: P) -> Vec<String> {
     let data = fs::read_to_string(path).expect("Failed to read JSON file");
     let v: Value = serde_json::from_str(&data).expect("Failed to parse JSON");
-    let obj = v.as_object().expect("Expected JSON object at root");
 
-    if let Some(hashes_value) = obj.get("hashes") {
-        if let Some(hashes_array) = hashes_value.as_array() {
-            return hashes_array
-                .iter()
-                .filter_map(|val| val.as_str().map(|s| s.to_string()))
-                .collect();
-        }
-    }
-
-    Vec::new()
+    v.as_array()
+        .map(|array| {
+            array.iter()
+                .filter_map(|item| {
+                    item.get("TLSH")
+                        .and_then(|t| t.as_str())
+                        .filter(|&s| s != "TNULL") 
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_else(Vec::new)
 }
 
 fn create_tlsh_object(hash: String) -> TlshDefault {
@@ -30,14 +31,14 @@ fn create_tlsh_object(hash: String) -> TlshDefault {
 
 // cargo run --bin test_tlsh
 pub fn main() {
-    let hashes = read_hashes_from_json("output_hashes.json");
+    let hashes = read_hashes_from_json("file_hashes.json");
     println!("Number of hashes: {:?}", hashes.len());
 
     // Initialize vectors before pushing
-    let dataset: Vec<String> = hashes[..60000].to_vec();
+    let dataset: Vec<String> = hashes[..42000].to_vec();
     let dataset_copy: Vec<String> = dataset.clone();
-    let queries: Vec<String> = hashes[1000000..1001000].to_vec();
-    let mut apotheosis = Apotheosis::<SimpleTlshRecord, TlshDistance, 32, 64, 64>::new();
+    let queries: Vec<String> = hashes[42000..43000].to_vec();
+    let mut apotheosis = Apotheosis::<SimpleTlshRecord, TlshDistance, 32, 200, 64>::new();
     let creation_start: Instant = Instant::now();
 
     println!(
@@ -45,10 +46,16 @@ pub fn main() {
         dataset.len(),
         queries.len()
     );
-    println!("Starting insertion into HNSW model...");
+
+    let mut records= vec![];
+
     for f in dataset_copy {
-        apotheosis.insert(SimpleTlshRecord::create(f));
+        println!("{:?}", f);
+        records.push(SimpleTlshRecord::create(f));
     }
+
+    println!("Inserting into NSG model...");
+    apotheosis.insert(records);
 
     let query_hash = TlshDefault::from_str(
         "T1008100007FFA5C48F0F33EB5AEB455158576FE205AB2CA6D51A4828F24B2B408961F3B",
@@ -86,7 +93,7 @@ pub fn main() {
 
     let brute_time: std::time::Duration = brute_start.elapsed();
 
-    let hnsw_start = Instant::now();
+    let nsg_start = Instant::now();
 
     println!("Starting APOTHEOSIS search...");
 
@@ -96,7 +103,7 @@ pub fn main() {
         apo_results.push((results[0].0, results[0].1.search_id()));
     }
 
-    let hnsw_time: std::time::Duration = hnsw_start.elapsed();
+    let nsg_time: std::time::Duration = nsg_start.elapsed();
 
     let mut matches = 0;
     for i in 0..apo_results.len() {
@@ -110,5 +117,5 @@ pub fn main() {
     println!("Matches: {}/{}", matches, apo_results.len());
     println!("Creation time: {:?}", creation_time);
     println!("Brute force time: {:?}", brute_time);
-    println!("HNSW search time: {:?}", hnsw_time);
+    println!("NSG search time: {:?}", nsg_time);
 }

@@ -15,18 +15,18 @@ fn main() -> std::io::Result<()> {
     let features: Vec<Vec<f32>> = Nsg::<L2Distance, Vec<f32>, 200, 500, 40>::load_fvecs(&fvecs_path)?;
     println!("Loaded {} features", features.len());
 
-    // Load reference KNN graph from file
-    println!("Loading reference KNN graph from {nn_graph_path}...");
-    let reference = Nsg::<L2Distance, Vec<f32>, 200, 500, 40>::load_nn_graph(&nn_graph_path)?;
+    // // Load reference KNN graph from file
+    // println!("Loading reference KNN graph from {nn_graph_path}...");
+    // let reference = Nsg::<L2Distance, Vec<f32>, 200, 500, 40>::load_nn_graph(&nn_graph_path)?;
 
-    // Write reference graph to text file
-    println!("Writing reference graph to reference.txt...");
-    let mut ref_file = std::fs::File::create("reference.txt")?;
-    for (node, nsg_node) in reference.iter().enumerate() {
-        let neighbors: Vec<String> = nsg_node.active_neighbors()
-            .iter().map(|nb| nb.to_string()).collect();
-        writeln!(ref_file, "{node}: [{}]", neighbors.join(", "))?;
-    }
+    // // Write reference graph to text file
+    // println!("Writing reference graph to reference.txt...");
+    // let mut ref_file = std::fs::File::create("reference.txt")?;
+    // for (node, nsg_node) in reference.iter().enumerate() {
+    //     let neighbors: Vec<String> = nsg_node.active_neighbors()
+    //         .iter().map(|nb| nb.to_string()).collect();
+    //     writeln!(ref_file, "{node}: [{}]", neighbors.join(", "))?;
+    // }
 
     // Build KNN graph with NNDescent
     println!("Building KNN graph with NNDescent (iter={iter})...");

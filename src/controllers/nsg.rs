@@ -1,8 +1,10 @@
 use crate::datalayer::algorithms::DistanceAlgorithm;
 use crate::datalayer::algorithms::Centroid;
 use crate::datalayer::nodes::NsgNode;
+use crate::controllers::nndescent::NNDescent;
 use core::cmp::min;
 use std::thread::current;
+use std::io::Write;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::{cmp, u32};
@@ -286,7 +288,7 @@ where
         self.navigating_node = self.random_node();
         debug!("init_graph: random entry point → {}", self.navigating_node);
         let results = self.knn_search(&center, 1, EF);
-        if let Some(&(_, idx)) = results.first() {
+        if let Some(&(_, idx, _)) = results.first() {
             self.navigating_node = idx;
         }
         debug!("init_graph: navigating_node -> {}", self.navigating_node);
@@ -369,6 +371,7 @@ where
                 let start = 0;
                 selected.push(temp_pool[start]);
 
+                // TODO: M or C?
                 'outer: for i in (start + 1)..temp_pool.len().min(C) {
                     if selected.len() >= M {
                         break;
@@ -481,7 +484,7 @@ where
     }
 
     fn find_root(&mut self, flags: &mut Vec<bool>) -> usize {
-        let n = self.features.len();
+        // let n = self.features.len();
 
         // Find fist unlinked node
         let unlinked_node = match flags.iter().position(|&flag| !flag) {
@@ -521,6 +524,7 @@ where
             .max_by_key(|&(_, &distance)| distance)
             .map(|(idx, _)| idx)
         {
+            // TODO: Should I insert in the position instead? Neighbors are not sorted by distance
             node.neighbors[position] = unlinked_node as u32;
             node.neighbor_distances[position] = distance;
         }
@@ -528,21 +532,58 @@ where
         root
     }
 
-    pub fn build(&mut self, nn_graph_path: &str, fvecs_path: &str) -> std::io::Result<()>
+    pub fn build(&mut self, nn_graph_path: &str) -> std::io::Result<()>
     where 
         // TODO: Get rid of this Vec<f32>
-        ID: From<Vec<f32>> + Clone + Centroid,
+        ID: Clone + Centroid,
     {
-        debug!("build: loading features from {}", fvecs_path);
-        self.features = Self::load_fvecs(fvecs_path)? 
-            .into_iter()
-            .map(ID::from)
-            .collect();
-        debug!("build: loaded {} features", self.features.len());
+        let features_copy = self.features.clone();
+        let iter = 10;
 
-        debug!("build: loading KNN graph from {}", nn_graph_path);
-        self.nnd_graph = Self::load_nn_graph(nn_graph_path)?;
-        debug!("build: loaded {} nodes", self.nnd_graph.len());
+        // Build KNN graph with NNDescent
+        println!("Building KNN graph with NNDescent (iter={iter})...");
+        let start = std::time::Instant::now();
+        let mut nnd = NNDescent::<D, ID, 50, 400, 10, 200>::new(features_copy);
+        let built = nnd.build(iter);
+        println!("Built in {:.3}s", start.elapsed().as_secs_f64());
+
+        // Write built graph to text file
+        println!("Writing built graph to built.txt...");
+        let mut built_file = std::fs::File::create("built.txt")?;
+        for (node, neighbors) in built.iter().enumerate() {
+            let neighbors_str: Vec<String> = neighbors.iter().map(|&(idx, _dist): &(usize, u32)| idx.to_string()).collect();
+            writeln!(built_file, "{node}: [{}]", neighbors_str.join(", "))?;
+        }
+
+        println!("Done!");
+
+        // debug!("build: loading features from {}", fvecs_path);
+        // self.features = Self::load_fvecs(fvecs_path)? 
+        //     .into_iter()
+        //     .map(ID::from)
+        //     .collect();
+        // debug!("build: loaded {} features", self.features.len());
+
+        // debug!("build: loading KNN graph from {}", nn_graph_path);
+        // self.nnd_graph = Self::load_nn_graph(nn_graph_path)?;
+        // debug!("build: loaded {} nodes", self.nnd_graph.len());
+
+        self.nnd_graph = built
+        .iter()
+        .enumerate()
+        .map(|(node_idx, neighbors)| {
+            let mut node = NsgNode::new_empty(node_idx as u32);
+            let count = neighbors.len().min(M);
+            node.neighbor_count = count as u16;
+            for (i, &(neighbor_idx, dist)) in neighbors.iter().take(count).enumerate() {
+                node.neighbors[i] = neighbor_idx as u32;
+                node.neighbor_distances[i] = dist;
+            }
+            node
+        })
+        .collect();
+
+        debug!("build: loaded {} nodes from NNDescent", self.nnd_graph.len());
 
         debug!("build: computing navigating node");
         self.init_graph();
@@ -561,7 +602,7 @@ where
         Ok(())
     }
 
-    pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize)> {
+    pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize, &ID)> {
         let mut visited_neighbors: HashSet<usize> = HashSet::new();
         // TODO: Insert enter_point?
 
@@ -615,7 +656,7 @@ where
 
                         if score < knn_neighbors[ef - 1].1 {
                             let pos = knn_neighbors.partition_point(|n| n.1 <= score);
-                            if pos != ef {
+                            if pos != ef { // TODO: score < knn_neigbors[ef - 1].1 already
                                 if knn_neighbors.len() == ef {
                                     knn_neighbors.pop();
                                 }
@@ -640,7 +681,7 @@ where
         knn_neighbors
             .into_iter()
             .take(k)
-            .map(|(index, distance, _)| (distance, index))
+            .map(|(index, distance, _)| (distance, index, &self.features[index]))
             .collect()
     }
 
@@ -706,5 +747,32 @@ where
     
         debug!("load: loaded {} nodes", self.nnd_graph.len());
         Ok(())
+    }
+
+    pub fn get_neighbors_node(&self, index: usize) -> Vec<(u32, usize, &ID)> {
+        let mut results: Vec<(u32, usize, &ID)> = vec![];
+
+        let node = &self.nnd_graph[index];
+
+        let neigbors = node.active_neighbors();
+
+        for neighbor_index in neigbors {
+            let score = self.distance.calculate_distance(
+                &self.features[*neighbor_index as usize],
+                &self.features[node.feature_index as usize],
+            );
+            results.push((
+                score,
+                *neighbor_index as usize,
+                &self.features[*neighbor_index as usize],
+            ));
+        }
+
+        // FIXME
+        results.sort_unstable_by_key(|&(dist, _, _)| dist);
+
+        results.insert(0, (0, index, &self.features[index]));
+
+        results
     }
 }
