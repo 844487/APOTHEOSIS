@@ -55,51 +55,57 @@ impl<const N: usize> Eq for HnswNode<N> {}
 
 // A node in the NSG data structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NsgNode<const N: usize> {
-    pub feature_index: u32, // Pointer to the data associated to this node
-    #[serde(with = "serde_array")]
-    pub neighbors: [u32; N],
-    #[serde(with = "serde_array")]
-    pub neighbor_distances: [u32; N],
-    pub neighbor_count: u16,
+pub struct NsgNode {
+    pub feature_index: u32,
+    pub neighbors: Vec<u32>,
+    pub neighbor_distances: Vec<u32>,
 }
 
-impl<const N: usize> NsgNode<N> {
+impl NsgNode {
     pub fn new_empty(feature_index: u32) -> Self {
         Self {
             feature_index,
-            neighbors: [u32::MAX; N],
-            neighbor_distances: [u32::MAX; N],
-            neighbor_count: 0,
+            neighbors: Vec::new(),
+            neighbor_distances: Vec::new(),
         }
     }
 
     #[inline]
     pub fn active_neighbors(&self) -> &[u32] {
-        &self.neighbors[..self.neighbor_count as usize]
+        &self.neighbors
     }
 
     #[inline]
     pub fn active_distances(&self) -> &[u32] {
-        &self.neighbor_distances[..self.neighbor_count as usize]
+        &self.neighbor_distances
+    }
+
+    #[inline]
+    pub fn neighbor_count(&self) -> usize {
+        self.neighbors.len()
+    }
+ 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.neighbors.is_empty()
     }
 }
 
-impl<const N: usize> Hash for NsgNode<N> {
+impl Hash for NsgNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.feature_index.hash(state);
-        self.neighbor_count.hash(state);
+        self.neighbor_count().hash(state);
     }
 }
 
-impl<const N: usize> PartialEq for NsgNode<N> {
+impl PartialEq for NsgNode {
     fn eq(&self, other: &Self) -> bool {
         self.feature_index == other.feature_index
-            && self.neighbor_count == other.neighbor_count
+            && self.neighbor_count() == other.neighbor_count()
     }
 }
 
-impl<const N: usize> Eq for NsgNode<N> {}
+impl Eq for NsgNode {}
 
 // Helper module for serializing and deserializing const-generic arrays
 // Serde does not support const-generic arrays directly so we need to do this garbage

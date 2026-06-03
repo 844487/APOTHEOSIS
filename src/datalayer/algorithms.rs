@@ -21,35 +21,8 @@ impl DistanceAlgorithm<TlshDefault> for TlshDistance {
     }
 }
 
-// Provisional, I need to make sure NSG works properly
-#[derive(Default)]
-pub struct L2Distance;
-impl DistanceAlgorithm<Vec<f32>> for L2Distance {
-    fn calculate_distance(&self, a: &Vec<f32>, b: &Vec<f32>) -> u32 {
-        let dist: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
-        dist.sqrt() as u32
-    }
-}
-
-// TODO: Try to treat the centroid as the query, search on the kNN graph
-// and take the returned nearest neighbor as the approximate medoid
 pub trait Centroid: Sized + Clone {
     fn centroid(features: &[Self]) -> Self;
-}
-
-impl Centroid for Vec<f32> {
-    fn centroid(features: &[Self]) -> Self {
-        let n = features.len() as f32;
-        let dim = features[0].len();
-        let mut center = vec![0f32; dim];
-        for f in features {
-            for (c, x) in center.iter_mut().zip(f.iter()) {
-                *c += x;
-            }
-        }
-        center.iter_mut().for_each(|c| *c /= n);
-        center
-    }
 }
 
 // We compute the medoid, a data point within the cluster that is the most 

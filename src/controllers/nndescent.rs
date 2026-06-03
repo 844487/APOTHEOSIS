@@ -1,11 +1,8 @@
+use crate::controllers::metric_tree::MetricTreeInit;
 use crate::datalayer::algorithms::DistanceAlgorithm;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use tracing::debug;
-
-fn default_rng() -> StdRng {
-    StdRng::seed_from_u64(42)
-}
 
 // K: number of final neighbors per node
 // L: candidate pool size per node
@@ -15,30 +12,28 @@ pub struct Nhood {
     // pool: (idx, dist, is_new)
     // is_new=true if neighbor was added in this iteration
     pub pool: Vec<(usize, u32, bool)>,
-    pub nn_new: Vec<usize>, // new added candidate neighbors
-    pub nn_old: Vec<usize>, // old candidate neighbors at previous iterations
-    pub rnn_new: Vec<usize>, // new added erverse candidate neighbors
-    pub rnn_old: Vec<usize>, // old reverse candidate neighbors
-    pub m: usize, // index of the last active neighbor ??
+    pub nn_new: Vec<usize>, // New added candidate neighbors
+    pub nn_old: Vec<usize>, // Old candidate neighbors at previous iterations
+    pub rnn_new: Vec<usize>, // New added erverse candidate neighbors
+    pub rnn_old: Vec<usize>, // Old reverse candidate neighbors
+    pub m: usize, // Processed entries in this iteration
 }
 
-pub struct NNDescent<D, ID, const K: usize, const L: usize, const S: usize, const R: usize>
+pub struct NNDescent<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize>
 where
     D: DistanceAlgorithm<ID> + Default,
-    ID: Clone,
 {
-    features: Vec<ID>,
+    features: &'a [ID],
     graph: Vec<Nhood>,
     distance: D,
     prng: StdRng,
 }
 
-impl<D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<D, ID, K, L, S, R>
+impl<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<'a, D, ID, K, L, S, R>
 where
     D: DistanceAlgorithm<ID> + Default,
-    ID: Clone,
 {
-    pub fn new(features: Vec<ID>) -> Self {
+    pub fn new(features: &'a [ID]) -> Self {
         let n = features.len();
         Self {
             features,
@@ -149,6 +144,7 @@ where
         for node in 0..n {
             // TODO: Pool is already sorted. Maybe do not insert at partition
             // point and then sort here?
+            // self.graph[node].pool.sort_unstable_by_key(|&(_, d, _)| d);
             self.graph[node].pool.truncate(L);
     
             // Advance until we have S new neighbors
@@ -218,9 +214,9 @@ where
             let mut rnn_old = std::mem::take(&mut self.graph[node].rnn_old);
     
             // TODO: Shuffle rnn. This should not be reached (it is the same
-            // in the C++ code)
+            // in the C++ code). Explore parallelisation.
             if rnn_new.len() > R {
-                debug!("update: rnn_new exceeded R={R}, shuffling — this should not happen");
+                debug!("update: rnn_new exceeded R={R}, shuffling");
                 for i in 0..R {
                     let j = i + self.prng.next_u64() as usize % (rnn_new.len() - i);
                     rnn_new.swap(i, j);
@@ -268,6 +264,107 @@ where
         }
     
         debug!("build: done");
+        final_graph
+    }
+}
+
+// VP-tree (metric-tree) initialisation
+// TODO: Check this
+impl<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<'a, D, ID, K, L, S, R>
+where
+    D: DistanceAlgorithm<ID> + Default,
+{
+    fn initialize_graph_metric_tree(&mut self, n_trees: usize, leaf_size: usize) {
+        let n = self.features.len();
+        self.graph.clear();
+
+        let mt = MetricTreeInit::<D, ID>::new(self.features, n_trees, leaf_size);
+        let candidates = mt.candidate_neighbors(&mut self.prng);
+
+        for i in 0..n {
+            // Rank the VP-tree candidates by the real distance metric, keep L
+            let mut scored: Vec<(usize, u32)> = candidates[i]
+                .iter()
+                .filter(|&&nb| nb != i)
+                .map(|&nb| {
+                    let dist = self
+                        .distance
+                        .calculate_distance(&self.features[i], &self.features[nb]);
+                    (nb, dist)
+                })
+                .collect();
+            scored.sort_unstable_by_key(|&(_, d)| d);
+            scored.truncate(L);
+
+            // Top up with random neighbors so every node still starts with at
+            // least S new candidates (matches the random-init guarantee)
+            let target = S.min(n.saturating_sub(1));
+            while scored.len() < target {
+                let r = self.random_node();
+                if r != i && !scored.iter().any(|&(idx, _)| idx == r) {
+                    let dist = self
+                        .distance
+                        .calculate_distance(&self.features[i], &self.features[r]);
+                    let pos = scored.partition_point(|&(_, d)| d <= dist);
+                    scored.insert(pos, (r, dist));
+                }
+            }
+
+            // Full candidate list stays in the pool (already capped at L above),
+            // but only the S nearest seed nn_new — otherwise the first join()
+            // fans out over the whole tree candidate set and blows up.
+            let nn_new: Vec<usize> = scored.iter().take(S).map(|&(idx, _)| idx).collect();
+            let pool: Vec<(usize, u32, bool)> =
+                scored.iter().map(|&(idx, d)| (idx, d, true)).collect();
+
+            self.graph.push(Nhood {
+                pool,
+                nn_new,
+                nn_old: Vec::new(),
+                rnn_new: Vec::new(),
+                rnn_old: Vec::new(),
+                m: 0,
+            });
+        }
+
+        debug!(
+            "initialize_graph_metric_tree: {} nodes initialized from {} VP-trees (leaf_size={})",
+            n, n_trees, leaf_size
+        );
+    }
+
+    pub fn build_with_metric_tree(
+        &mut self,
+        iter: usize,
+        n_trees: usize,
+        leaf_size: usize,
+    ) -> Vec<Vec<(usize, u32)>> {
+        let n = self.features.len();
+        debug!(
+            "build_with_metric_tree: VP-tree init then NN-descent, n={}, K={K}, L={L}, S={S}, R={R}, n_trees={}, leaf_size={}",
+            n, n_trees, leaf_size
+        );
+        self.initialize_graph_metric_tree(n_trees, leaf_size);
+
+        for it in 0..iter {
+            debug!("build_with_metric_tree: iteration {}/{}", it + 1, iter);
+            self.join();
+            self.update();
+        }
+
+        debug!("build_with_metric_tree: extracting K={K} best neighbors");
+        let mut final_graph: Vec<Vec<(usize, u32)>> = Vec::with_capacity(n);
+        for node in 0..n {
+            let neighbors = self.graph[node]
+                .pool
+                .iter()
+                .take(K)
+                .map(|&(idx, dist, _)| (idx, dist))
+                .collect();
+            final_graph.push(neighbors);
+        }
+
+        debug!("build_with_metric_tree: done");
         final_graph
     }
 }

@@ -1,14 +1,14 @@
 // FIXME
-use crate::datalayer::record::{self, RadixKeyMapping};
+use crate::datalayer::record::{RadixKeyMapping};
 
 use crate::controllers::nsg::Nsg;
 use crate::controllers::radix_tree::RadixNode;
 use crate::datalayer::algorithms::DistanceAlgorithm;
 use crate::datalayer::algorithms::Centroid;
 use crate::datalayer::record::ApotheosisRecord;
-use gexf::{Edge, EdgeType, Gexf, Node as GefxNode};
+// use gexf::{Edge, EdgeType, Gexf, Node as GefxNode};
 use std::fs::{self};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(bound(
@@ -34,7 +34,6 @@ where
 
     pub fn new() -> Self {
         Self {
-            // hnsw: Hnsw::new(),
             nsg: Nsg::new(),
             radix: RadixNode::<u8, Option<usize>>::new(vec![], None),
             records: vec![],
@@ -49,9 +48,7 @@ where
 
         self.records = records;
 
-        self.nsg.set_features(features);
-
-        let _ = self.nsg.build("built.txt");
+        let _ = self.nsg.build(features);
 
         for (index, record) in self.records.iter().enumerate() {
             if let Some(key) = record.search_id().to_radix_key() {
@@ -84,11 +81,13 @@ where
         k: usize,
         ef_search: Option<usize>,
     ) -> Vec<(u32, &R)> {
-        let ef_search = ef_search.unwrap_or(24);
+        let ef_search = ef_search.unwrap_or(EF);
 
         let nsg_results: Vec<(u32, usize, &R::MetricId)> = if let Some(key) = query.to_radix_key() {
             if let Some(radix_node) = self.radix.find(&key) {
                 if let Some(Some(node_index)) = radix_node.data {
+                    // TODO: This does not work as expected. It returs the
+                    // NSG neighbors (which are not necessarily the closests)
                     self.nsg.get_neighbors_node(node_index)
                 } else {
                     self.nsg.knn_search(query, k, ef_search)

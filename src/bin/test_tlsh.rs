@@ -39,6 +39,7 @@ pub fn main() {
     let dataset_copy: Vec<String> = dataset.clone();
     let queries: Vec<String> = hashes[42000..43000].to_vec();
     let mut apotheosis = Apotheosis::<SimpleTlshRecord, TlshDistance, 32, 200, 64>::new();
+
     let creation_start: Instant = Instant::now();
 
     println!(
@@ -50,7 +51,7 @@ pub fn main() {
     let mut records= vec![];
 
     for f in dataset_copy {
-        println!("{:?}", f);
+        // println!("{:?}", f);
         records.push(SimpleTlshRecord::create(f));
     }
 
@@ -105,16 +106,23 @@ pub fn main() {
 
     let nsg_time: std::time::Duration = nsg_start.elapsed();
 
-    let mut matches = 0;
+    let mut recall_at_1 = 0; // NSG found a point at the true-nearest distance
+    let mut exact_same_point = 0; // ...and it's literally the same point brute picked
+    let mut genuine_miss = 0; // NSG's nearest is strictly farther than brute's
+    
     for i in 0..apo_results.len() {
-        if apo_results[i].0 == brute_results[i].0
-            && apo_results[i].1.hash() == brute_results[i].1.hash()
-        {
-            matches += 1;
+        if apo_results[i].0 == brute_results[i].0 {
+            recall_at_1 += 1;
+            if apo_results[i].1.hash() == brute_results[i].1.hash() {
+                exact_same_point += 1;
+            }
+        } else {
+            genuine_miss += 1;
         }
     }
-
-    println!("Matches: {}/{}", matches, apo_results.len());
+    println!("Recall@1 (distance): {}/{}", recall_at_1, apo_results.len());
+    println!("Exact same point: {}/{}", exact_same_point, apo_results.len());
+    println!("Genuine misses: {}/{}", genuine_miss, apo_results.len());
     println!("Creation time: {:?}", creation_time);
     println!("Brute force time: {:?}", brute_time);
     println!("NSG search time: {:?}", nsg_time);

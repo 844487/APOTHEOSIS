@@ -289,8 +289,8 @@ where
             }
         }
     }
-
     // WIP
+    #[allow(dead_code)]
     fn connect_neighbors_heuristic(
         &mut self,
         new_node_index: u32,
