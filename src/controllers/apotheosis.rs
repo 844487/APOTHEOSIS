@@ -1,7 +1,7 @@
 // FIXME
 use crate::datalayer::record::{RadixKeyMapping};
 
-use crate::controllers::nsg::Nsg;
+use crate::controllers::nsg::{BuildConfig, Nsg};
 use crate::controllers::radix_tree::RadixNode;
 use crate::datalayer::algorithms::DistanceAlgorithm;
 use crate::datalayer::algorithms::Centroid;
@@ -15,28 +15,31 @@ use std::path::Path;
     serialize = "R: ApotheosisRecord + serde::Serialize, D: DistanceAlgorithm<R::MetricId> + serde::Serialize, R::MetricId: serde::Serialize",
     deserialize = "R: ApotheosisRecord + serde::Deserialize<'de>, D: DistanceAlgorithm<R::MetricId> + serde::Deserialize<'de>, R::MetricId: serde::Deserialize<'de>"
 ))]
-pub struct Apotheosis<R, D, const M: usize = 16, const C: usize = 500, const EF: usize = 400>
+pub struct Apotheosis<R, D>
 where
     R: ApotheosisRecord,
     D: DistanceAlgorithm<R::MetricId> + Default,
 {
-    pub nsg: Nsg<D, R::MetricId, M, C, EF>,
+    pub nsg: Nsg<D, R::MetricId>,
     pub radix: RadixNode<u8, Option<usize>>,
     pub records: Vec<R>,
+    #[serde(skip, default)]
+    pub config: BuildConfig,
 }
 
-impl<R, D, const M: usize, const C: usize, const EF: usize> Apotheosis<R, D, M, C, EF>
+impl<R, D> Apotheosis<R, D>
 where
     R: ApotheosisRecord,
     D: DistanceAlgorithm<R::MetricId> + Default,
     R::MetricId: Centroid
 {
 
-    pub fn new() -> Self {
+    pub fn new(config: BuildConfig) -> Self {
         Self {
             nsg: Nsg::new(),
             radix: RadixNode::<u8, Option<usize>>::new(vec![], None),
             records: vec![],
+            config,
         }
     }
 
@@ -48,7 +51,8 @@ where
 
         self.records = records;
 
-        let _ = self.nsg.build(features);
+        let cfg = self.config;
+        let _ = self.nsg.build(features, &cfg);
 
         for (index, record) in self.records.iter().enumerate() {
             if let Some(key) = record.search_id().to_radix_key() {
@@ -81,7 +85,7 @@ where
         k: usize,
         ef_search: Option<usize>,
     ) -> Vec<(u32, &R)> {
-        let ef_search = ef_search.unwrap_or(EF);
+        let ef_search = ef_search.unwrap_or_else(|| self.nsg.default_ef());
 
         let nsg_results: Vec<(u32, usize, &R::MetricId)> = if let Some(key) = query.to_radix_key() {
             if let Some(radix_node) = self.radix.find(&key) {

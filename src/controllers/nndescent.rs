@@ -4,6 +4,21 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use tracing::debug;
 
+/// Runtime NN-descent sizes (see the comment on `Nhood`)
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NndParams {
+    pub k: usize,
+    pub l: usize,
+    pub s: usize,
+    pub r: usize,
+}
+
+impl Default for NndParams {
+    fn default() -> Self {
+        Self { k: 50, l: 400, s: 10, r: 200 }
+    }
+}
+
 // K: number of final neighbors per node
 // L: candidate pool size per node
 // S: number of initial random neighbors
@@ -19,7 +34,7 @@ pub struct Nhood {
     pub m: usize, // Processed entries in this iteration
 }
 
-pub struct NNDescent<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize>
+pub struct NNDescent<'a, D, ID>
 where
     D: DistanceAlgorithm<ID> + Default,
 {
@@ -27,19 +42,22 @@ where
     graph: Vec<Nhood>,
     distance: D,
     prng: StdRng,
+    params: NndParams,
 }
 
-impl<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<'a, D, ID, K, L, S, R>
+#[allow(non_snake_case)]
+impl<'a, D, ID> NNDescent<'a, D, ID>
 where
     D: DistanceAlgorithm<ID> + Default,
 {
-    pub fn new(features: &'a [ID]) -> Self {
+    pub fn new(features: &'a [ID], params: NndParams) -> Self {
         let n = features.len();
         Self {
             features,
             graph: Vec::with_capacity(n),
             distance: D::default(),
             prng: StdRng::seed_from_u64(42),
+            params,
         }
     }
 
@@ -50,6 +68,7 @@ where
     }
 
     fn initialize_graph(&mut self) {
+        let S = self.params.s;
         let n = self.features.len();
         self.graph.clear();
 
@@ -85,6 +104,7 @@ where
     }
 
     fn insert(&mut self, node: usize, neighbor: usize, distance: u32) {
+        let L = self.params.l;
         let pool = &mut self.graph[node].pool;
     
         // Already in the pool
@@ -133,6 +153,9 @@ where
     }
 
     fn update(&mut self) {
+        let S = self.params.s;
+        let L = self.params.l;
+        let R = self.params.r;
         let n = self.features.len();
     
         // Clear nn_new/nn_old
@@ -243,6 +266,10 @@ where
     }
 
     pub fn build(&mut self, iter: usize) -> Vec<Vec<(usize, u32)>> {
+        let K = self.params.k;
+        let L = self.params.l;
+        let S = self.params.s;
+        let R = self.params.r;
         let n = self.features.len();
         debug!("build: initializing graph with {} nodes, K={K}, L={L}, S={S}, R={R}", n);
         self.initialize_graph();
@@ -270,11 +297,14 @@ where
 
 // VP-tree (metric-tree) initialisation
 // TODO: Check this
-impl<'a, D, ID, const K: usize, const L: usize, const S: usize, const R: usize> NNDescent<'a, D, ID, K, L, S, R>
+#[allow(non_snake_case)]
+impl<'a, D, ID> NNDescent<'a, D, ID>
 where
     D: DistanceAlgorithm<ID> + Default,
 {
     fn initialize_graph_metric_tree(&mut self, n_trees: usize, leaf_size: usize) {
+        let L = self.params.l;
+        let S = self.params.s;
         let n = self.features.len();
         self.graph.clear();
 
@@ -297,7 +327,7 @@ where
             scored.truncate(L);
 
             // Top up with random neighbors so every node still starts with at
-            // least S new candidates (matches the random-init guarantee)
+            // least S new candidates
             let target = S.min(n.saturating_sub(1));
             while scored.len() < target {
                 let r = self.random_node();
@@ -311,8 +341,7 @@ where
             }
 
             // Full candidate list stays in the pool (already capped at L above),
-            // but only the S nearest seed nn_new — otherwise the first join()
-            // fans out over the whole tree candidate set and blows up.
+            // but only the S nearest seed nn_new
             let nn_new: Vec<usize> = scored.iter().take(S).map(|&(idx, _)| idx).collect();
             let pool: Vec<(usize, u32, bool)> =
                 scored.iter().map(|&(idx, d)| (idx, d, true)).collect();
@@ -339,6 +368,10 @@ where
         n_trees: usize,
         leaf_size: usize,
     ) -> Vec<Vec<(usize, u32)>> {
+        let K = self.params.k;
+        let L = self.params.l;
+        let S = self.params.s;
+        let R = self.params.r;
         let n = self.features.len();
         debug!(
             "build_with_metric_tree: VP-tree init then NN-descent, n={}, K={K}, L={L}, S={S}, R={R}, n_trees={}, leaf_size={}",

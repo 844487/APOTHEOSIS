@@ -13,6 +13,49 @@ fn default_rng() -> StdRng {
     StdRng::seed_from_u64(42)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NndInit {
+    Random,
+    MetricTree,
+}
+
+/// Runtime NSG structural sizes (see the comment on the `Nsg` struct)
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NsgParams {
+    pub m: usize,
+    pub c: usize,
+    pub ef: usize,
+}
+
+impl Default for NsgParams {
+    fn default() -> Self {
+        Self { m: 16, c: 500, ef: 400 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BuildConfig {
+    pub nsg: NsgParams,
+    pub nnd: crate::controllers::nndescent::NndParams,
+    pub init: NndInit,
+    pub iter: usize,
+    pub n_trees: usize,
+    pub leaf_size: usize,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            nsg: NsgParams::default(),
+            nnd: crate::controllers::nndescent::NndParams::default(),
+            init: NndInit::MetricTree,
+            iter: 10,
+            n_trees: 16,
+            leaf_size: 32,
+        }
+    }
+}
+
 // M: max out-degree (R in the reference NSG)
 // C: max candidates considered in sync prune
 // EF: candidate pool size for greedy search
@@ -21,7 +64,7 @@ fn default_rng() -> StdRng {
     serialize = "ID: serde::Serialize, D: DistanceAlgorithm<ID> + serde::Serialize",
     deserialize = "ID: serde::Deserialize<'de>, D: DistanceAlgorithm<ID> + serde::Deserialize<'de>"
 ))]
-pub struct Nsg<D, ID, const M: usize, const C: usize, const EF: usize = 400>
+pub struct Nsg<D, ID>
 where
     ID: Clone,
     D: DistanceAlgorithm<ID> + Default,
@@ -33,14 +76,19 @@ where
     prng: StdRng,
     distance: D,
     alpha: f32, // TODO: Move this
+    m: usize,
+    c: usize,
+    ef: usize,
 }
 
-impl<D, ID, const M: usize, const C: usize, const EF: usize> Nsg<D, ID, M, C, EF>
+#[allow(non_snake_case)]
+impl<D, ID> Nsg<D, ID>
 where
     ID: Clone,
     D: DistanceAlgorithm<ID> + Default,
 {
     pub fn new() -> Self {
+        let p = NsgParams::default();
         Self {
             features: vec![],
             nnd_graph: vec![],
@@ -48,7 +96,15 @@ where
             prng: StdRng::seed_from_u64(42),
             distance: D::default(),
             alpha: 1.2,
+            m: p.m,
+            c: p.c,
+            ef: p.ef,
         }
+    }
+
+    #[inline]
+    pub fn default_ef(&self) -> usize {
+        self.ef
     }
 
     #[inline]
@@ -148,6 +204,7 @@ where
     where
         ID: Centroid,
     {
+        let EF = self.ef;
         let center = ID::centroid(&self.features);
         self.navigating_node = self.random_node();
         debug!("init_graph: random entry point → {}", self.navigating_node);
@@ -159,6 +216,8 @@ where
     }
 
     fn sync_prune(&self, node: usize, candidates: &mut Vec<(usize, u32)>) -> Vec<(usize, u32)> {
+        let M = self.m;
+        let C = self.c;
         for neighbor in self.nnd_graph[node].active_neighbors() {
             let neighbor_feature_index = *neighbor as usize;
             if candidates.iter().any(|(idx, _)| *idx == neighbor_feature_index) {
@@ -235,6 +294,7 @@ where
     // cut_graph is a temporal graph
     // for every edge [node -> neighbor], it adds the edge [neighbor -> node]
     fn inter_insert(&self, node: usize, selected: &Vec<(usize, u32)>, cut_graph: &mut Vec<Vec<(usize, u32)>>) {
+        let M = self.m;
         for &(neighbor, distance) in selected {
             let neighbor_pool = &cut_graph[neighbor];
 
@@ -299,6 +359,7 @@ where
     }
 
     fn link(&mut self) {
+        let EF = self.ef;
         let n = self.features.len();
         let mut cut_graph: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
         debug!("link: building NSG edges for {} nodes", n);
@@ -379,6 +440,7 @@ where
     }
 
     fn find_root(&mut self, flags: &mut Vec<bool>) -> usize {
+        let EF = self.ef;
         // Find first unlinked node
         let unlinked_node = match flags.iter().position(|&flag| !flag) {
             Some(idx) => idx,
@@ -413,12 +475,15 @@ where
         root
     }
 
-    pub fn build(&mut self, features: Vec<ID>) -> std::io::Result<()>
+    pub fn build(&mut self, features: Vec<ID>, cfg: &BuildConfig) -> std::io::Result<()>
     where
         ID: Centroid,
     {
         self.features = features;
-        let iter = 10;
+        self.m = cfg.nsg.m;
+        self.c = cfg.nsg.c;
+        self.ef = cfg.nsg.ef;
+        let iter = cfg.iter;
 
         // Build KNN graph with NNDescent
         debug!("Building KNN graph with NNDescent (iter={iter})...");
@@ -426,10 +491,13 @@ where
         // let mut nnd = NNDescent::<D, ID, 50, 400, 10, 200>::new(&self.features);
         // let built = nnd.build(iter);
 
-        let mut nnd = NNDescent::<D, ID, 50, 400, 10, 200>::new(&self.features);
+        let mut nnd = NNDescent::<D, ID>::new(&self.features, cfg.nnd);
         // VP-tree initialisation parameters: number of randomized trees and leaf size
-        let (n_trees, leaf_size) = (16, 32);
-        let built = nnd.build_with_metric_tree(iter, n_trees, leaf_size);
+        let (n_trees, leaf_size) = (cfg.n_trees, cfg.leaf_size);
+        let built = match cfg.init {
+            NndInit::Random => nnd.build(iter),
+            NndInit::MetricTree => nnd.build_with_metric_tree(iter, n_trees, leaf_size),
+        };
 
         debug!("Built in {:.3}s", start.elapsed().as_secs_f64());
 
@@ -545,6 +613,7 @@ where
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
 
+        let M = self.m;
         let mut file = std::fs::File::create(path)?;
         let mut buf4;
 
@@ -572,6 +641,7 @@ where
     pub fn load(&mut self, path: &str) -> std::io::Result<()> {
         use std::io::Read;
 
+        let M = self.m;
         let mut file = std::fs::File::open(path)?;
         let mut buf4 = [0u8; 4];
 
