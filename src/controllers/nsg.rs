@@ -13,6 +13,49 @@ fn default_rng() -> StdRng {
     StdRng::seed_from_u64(42)
 }
 
+/// Reusable visited-set for a search
+#[derive(Default)]
+pub struct SearchScratch {
+    visited: Vec<u32>,
+    epoch: u32,
+}
+
+impl SearchScratch {
+    pub fn new(n: usize) -> Self {
+        Self { visited: vec![0u32; n], epoch: 0 }
+    }
+
+    #[inline]
+    fn begin(&mut self, n: usize) {
+        if self.visited.len() != n {
+            self.visited.clear();
+            self.visited.resize(n, 0);
+            self.epoch = 0;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.visited.iter_mut().for_each(|v| *v = 0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    fn mark(&mut self, idx: usize) {
+        self.visited[idx] = self.epoch;
+    }
+
+    /// True if `idx` was newly visited
+    #[inline]
+    fn visit(&mut self, idx: usize) -> bool {
+        if self.visited[idx] != self.epoch {
+            self.visited[idx] = self.epoch;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NndInit {
     Random,
@@ -117,10 +160,10 @@ where
         &mut self,
         query_id: &ID,
         ef: usize,
+        scratch: &mut SearchScratch,
     ) -> (Vec<(usize, u32)>, Vec<(usize, u32)>) {
+        scratch.begin(self.features.len());
         let enter_point = self.navigating_node as usize;
-
-        let mut visited_neighbors: HashSet<usize> = HashSet::new();
 
         let mut knn_neighbors: Vec<(usize, u32, bool)> = Vec::with_capacity(ef + 1);
 
@@ -133,7 +176,7 @@ where
             }
 
             let neighbor_feature_index = *neighbor as usize;
-            visited_neighbors.insert(neighbor_feature_index);
+            scratch.mark(neighbor_feature_index);
             let score = self
                 .distance
                 .calculate_distance(&self.features[neighbor_feature_index], query_id);
@@ -145,7 +188,7 @@ where
         let ef = ef.min(self.features.len()); // In case features.len() < ef
         while knn_neighbors.len() < ef {
             let neighbor_feature_index = self.random_node();
-            if visited_neighbors.insert(neighbor_feature_index) {
+            if scratch.visit(neighbor_feature_index) {
                 let score = self
                     .distance
                     .calculate_distance(&self.features[neighbor_feature_index], query_id);
@@ -164,7 +207,7 @@ where
                 knn_neighbors[current_neighbor_to_expand].2 = false;
                 for neighbor in self.nnd_graph[candidate].active_neighbors() {
                     let neighbor_feature_index = *neighbor as usize;
-                    if visited_neighbors.insert(neighbor_feature_index) {
+                    if scratch.visit(neighbor_feature_index) {
                         let score = self
                             .distance
                             .calculate_distance(&self.features[neighbor_feature_index], query_id);
@@ -218,9 +261,10 @@ where
     fn sync_prune(&self, node: usize, candidates: &mut Vec<(usize, u32)>) -> Vec<(usize, u32)> {
         let M = self.m;
         let C = self.c;
+        let mut present: HashSet<usize> = candidates.iter().map(|&(idx, _)| idx).collect();
         for neighbor in self.nnd_graph[node].active_neighbors() {
             let neighbor_feature_index = *neighbor as usize;
-            if candidates.iter().any(|(idx, _)| *idx == neighbor_feature_index) {
+            if !present.insert(neighbor_feature_index) {
                 continue;
             }
             let score = self.distance.calculate_distance(
@@ -296,16 +340,14 @@ where
     fn inter_insert(&self, node: usize, selected: &Vec<(usize, u32)>, cut_graph: &mut Vec<Vec<(usize, u32)>>) {
         let M = self.m;
         for &(neighbor, distance) in selected {
-            let neighbor_pool = &cut_graph[neighbor];
-
-            if neighbor_pool.iter().any(|&(idx, _)| idx == node) {
+            if cut_graph[neighbor].iter().any(|&(idx, _)| idx == node) {
                 continue;
             }
 
-            let mut temp_pool = neighbor_pool.clone();
-            temp_pool.push((node, distance));
+            cut_graph[neighbor].push((node, distance));
 
-            if temp_pool.len() > M {
+            if cut_graph[neighbor].len() > M {
+                let mut temp_pool = std::mem::take(&mut cut_graph[neighbor]);
                 temp_pool.sort_unstable_by_key(|&(_, distance)| distance);
 
                 let mut result: Vec<(usize, u32)> = Vec::with_capacity(M);
@@ -352,8 +394,6 @@ where
                 }
 
                 cut_graph[neighbor] = result;
-            } else {
-                cut_graph[neighbor] = temp_pool;
             }
         }
     }
@@ -362,17 +402,19 @@ where
         let EF = self.ef;
         let n = self.features.len();
         let mut cut_graph: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
+        let mut scratch = SearchScratch::new(n);
         debug!("link: building NSG edges for {} nodes", n);
 
         for node in 0..n {
             let node_feature = self.features[node].clone();
-            let (_, mut fullset) = self.get_neighbors(&node_feature, EF);
+            let (_, mut fullset) = self.get_neighbors(&node_feature, EF, &mut scratch);
             cut_graph[node] = self.sync_prune(node, &mut fullset);
         }
 
         for node in 0..n {
-            let selected = cut_graph[node].clone();
+            let selected = std::mem::take(&mut cut_graph[node]);
             self.inter_insert(node, &selected, &mut cut_graph);
+            cut_graph[node] = selected;
         }
 
         // Write cut_graph back into nnd_graph
@@ -392,6 +434,7 @@ where
         let mut flags = vec![false; n];
         let mut root = self.navigating_node;
         let mut unlinked_count = 0;
+        let mut scratch = SearchScratch::new(n);
         debug!("tree_grow: checking connectivity from navigating_node={}", self.navigating_node);
 
         while unlinked_count < n {
@@ -400,7 +443,7 @@ where
             if unlinked_count >= n {
                 break;
             }
-            root = self.find_root(&mut flags);
+            root = self.find_root(&mut flags, &mut scratch);
             debug!("tree_grow: new root → {}", root);
         }
 
@@ -413,33 +456,41 @@ where
     }
 
     fn dfs(&self, flags: &mut Vec<bool>, root: usize, count: &mut usize) {
-        let mut stack = vec![root];
+        let mut stack: Vec<(usize, usize)> = Vec::new();
         if !flags[root] {
             *count += 1;
         }
         flags[root] = true;
+        stack.push((root, 0));
 
-        while let Some(node) = stack.last().copied() {
-            let next = self.nnd_graph[node].active_neighbors()
-                .iter()
-                .map(|&neighbor| neighbor as usize)
-                .find(|&neighbor| !flags[neighbor]);
+        while let Some(&(node, cursor)) = stack.last() {
+            let neighbors = self.nnd_graph[node].active_neighbors();
+            let mut next = None;
+            let mut c = cursor;
+            while c < neighbors.len() {
+                let neighbor = neighbors[c] as usize;
+                c += 1;
+                if !flags[neighbor] {
+                    next = Some(neighbor);
+                    break;
+                }
+            }
+            stack.last_mut().unwrap().1 = c; // Update cursor for this node
 
             match next {
                 Some(neighbor) => {
                     flags[neighbor] = true;
                     *count += 1;
-                    stack.push(neighbor);
+                    stack.push((neighbor, 0));
                 }
                 None => {
-                    // All neighbors have already been visited in the search
                     stack.pop();
                 }
             }
         }
     }
 
-    fn find_root(&mut self, flags: &mut Vec<bool>) -> usize {
+    fn find_root(&mut self, flags: &mut Vec<bool>, scratch: &mut SearchScratch) -> usize {
         let EF = self.ef;
         // Find first unlinked node
         let unlinked_node = match flags.iter().position(|&flag| !flag) {
@@ -449,7 +500,7 @@ where
         debug!("find_root: connecting unlinked node {}", unlinked_node);
 
         let unlinked_node_feature = self.features[unlinked_node].clone();
-        let (_, mut fullset) = self.get_neighbors(&unlinked_node_feature, EF);
+        let (_, mut fullset) = self.get_neighbors(&unlinked_node_feature, EF, scratch);
         fullset.sort_unstable_by_key(|&(_, distance)| distance);
 
         let root = fullset.iter()
@@ -532,7 +583,8 @@ where
     }
 
     pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize, &ID)> {
-        let mut visited_neighbors: HashSet<usize> = HashSet::new();
+        let mut scratch = SearchScratch::new(self.features.len());
+        scratch.begin(self.features.len());
 
         // (index, score, needs_expansion)
         let mut knn_neighbors: Vec<(usize, u32, bool)> = Vec::with_capacity(ef + 1);
@@ -545,7 +597,7 @@ where
             }
 
             let neighbor_feature_index = *neighbor as usize;
-            visited_neighbors.insert(neighbor_feature_index);
+            scratch.mark(neighbor_feature_index);
             let score = self
                 .distance
                 .calculate_distance(&self.features[neighbor_feature_index], query_id);
@@ -556,7 +608,7 @@ where
         let ef = ef.min(self.features.len());
         while knn_neighbors.len() < ef {
             let neighbor_feature_index = self.random_node();
-            if visited_neighbors.insert(neighbor_feature_index) {
+            if scratch.visit(neighbor_feature_index) {
                 let score = self
                     .distance
                     .calculate_distance(&self.features[neighbor_feature_index], query_id);
@@ -576,7 +628,7 @@ where
 
                 for neighbor in self.nnd_graph[candidate].active_neighbors() {
                     let neighbor_feature_index = *neighbor as usize;
-                    if visited_neighbors.insert(neighbor_feature_index) {
+                    if scratch.visit(neighbor_feature_index) {
                         let score = self
                             .distance
                             .calculate_distance(&self.features[neighbor_feature_index], query_id);
