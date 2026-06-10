@@ -98,11 +98,11 @@ where
                     }
                 }
             }
-        }
 
-        for c in candidates.iter_mut() {
-            c.sort_unstable();
-            c.dedup();
+            for c in candidates.iter_mut() {
+                c.sort_unstable();
+                c.dedup();
+            }
         }
 
         candidates

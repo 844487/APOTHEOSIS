@@ -106,6 +106,11 @@ where
     fn insert(&mut self, node: usize, neighbor: usize, distance: u32) {
         let L = self.params.l;
         let pool = &mut self.graph[node].pool;
+
+        // Pool is full and the candidate is no better than the current worst
+        if pool.len() >= L && distance >= pool.last().unwrap().1 {
+            return;
+        }
     
         // Already in the pool
         if pool.iter().any(|&(idx, _, _)| idx == neighbor) { return; }
@@ -122,35 +127,28 @@ where
 
     fn join(&mut self) {
         let n = self.features.len();
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-
         for node in 0..n {
-            let nn_new = &self.graph[node].nn_new;
-            let nn_old = &self.graph[node].nn_old;
-
-            for &i in nn_new {
-                for &j in nn_new {
-                    if i < j  {
-                        pairs.push((i, j));
+            let nn_new = self.graph[node].nn_new.clone();
+            let nn_old = self.graph[node].nn_old.clone();
+    
+            for &i in &nn_new {
+                for &j in &nn_new {
+                    if i < j {
+                        let d = self.distance.calculate_distance(&self.features[i], &self.features[j]);
+                        self.insert(i, j, d);
+                        self.insert(j, i, d);
                     }
                 }
-
-                for &j in nn_old {
+                for &j in &nn_old {
                     if i != j {
-                        pairs.push((i, j));
+                        let d = self.distance.calculate_distance(&self.features[i], &self.features[j]);
+                        self.insert(i, j, d);
+                        self.insert(j, i, d);
                     }
                 }
             }
         }
-
-        for (i, j) in pairs {
-            let distance = self
-                .distance
-                .calculate_distance(&self.features[i], &self.features[j]);
-            self.insert(i, j, distance);
-            self.insert(j, i, distance);
-        }
-    }
+    }    
 
     fn update(&mut self) {
         let S = self.params.s;
