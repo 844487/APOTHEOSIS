@@ -1,4 +1,4 @@
-use crate::controllers::metric_tree::MetricTreeInit;
+use crate::controllers::vp_forest::VpForest;
 use crate::datalayer::algorithms::DistanceAlgorithm;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -270,15 +270,26 @@ where
         let R = self.params.r;
         let n = self.features.len();
         debug!("build: initializing graph with {} nodes, K={K}, L={L}, S={S}, R={R}", n);
+        let profile = std::env::var("NSG_PROFILE").is_ok();
+
+        let t = std::time::Instant::now();
         self.initialize_graph();
-    
+        let t_init = t.elapsed();
+
+        let mut t_join = std::time::Duration::ZERO;
+        let mut t_update = std::time::Duration::ZERO;
         for it in 0..iter {
             debug!("build: iteration {}/{}", it + 1, iter);
+            let a = std::time::Instant::now();
             self.join();
+            t_join += a.elapsed();
+            let b = std::time::Instant::now();
             self.update();
+            t_update += b.elapsed();
         }
-    
+
         debug!("build: extracting K={K} best neighbors");
+        let t = std::time::Instant::now();
         let mut final_graph: Vec<Vec<(usize, u32)>> = Vec::with_capacity(n);
         for node in 0..n {
             let neighbors = self.graph[node].pool.iter()
@@ -287,7 +298,18 @@ where
                 .collect();
             final_graph.push(neighbors);
         }
-    
+        let t_extract = t.elapsed();
+
+        if profile {
+            eprintln!(
+                "[profile][nndescent/random] init(random)={:.3?}  join(sum/{} it)={:.3?} ({:.3?}/it)  update(sum)={:.3?} ({:.3?}/it)  extract={:.3?}",
+                t_init,
+                iter, t_join, t_join.checked_div(iter as u32).unwrap_or_default(),
+                t_update, t_update.checked_div(iter as u32).unwrap_or_default(),
+                t_extract,
+            );
+        }
+
         debug!("build: done");
         final_graph
     }
@@ -305,10 +327,14 @@ where
         let S = self.params.s;
         let n = self.features.len();
         self.graph.clear();
+        let profile = std::env::var("NSG_PROFILE").is_ok();
 
-        let mt = MetricTreeInit::<D, ID>::new(self.features, n_trees, leaf_size);
+        let t = std::time::Instant::now();
+        let mt = VpForest::<D, ID>::new(self.features, n_trees, leaf_size);
         let candidates = mt.candidate_neighbors(&mut self.prng);
+        let t_vptree = t.elapsed();
 
+        let t = std::time::Instant::now();
         for i in 0..n {
             // Rank the VP-tree candidates by the real distance metric, keep L
             let mut scored: Vec<(usize, u32)> = candidates[i]
@@ -358,6 +384,13 @@ where
             "initialize_graph_metric_tree: {} nodes initialized from {} VP-trees (leaf_size={})",
             n, n_trees, leaf_size
         );
+
+        if profile {
+            eprintln!(
+                "[profile][nndescent/mt-init]   vp_tree(build+candidates)={:.3?}  rank+seed={:.3?}",
+                t_vptree, t.elapsed(),
+            );
+        }
     }
 
     pub fn build_with_metric_tree(
@@ -375,15 +408,25 @@ where
             "build_with_metric_tree: VP-tree init then NN-descent, n={}, K={K}, L={L}, S={S}, R={R}, n_trees={}, leaf_size={}",
             n, n_trees, leaf_size
         );
+        let init_start = std::time::Instant::now();
         self.initialize_graph_metric_tree(n_trees, leaf_size);
+        let profile = std::env::var("NSG_PROFILE").is_ok();
+        let t_init = init_start.elapsed();
 
+        let mut t_join = std::time::Duration::ZERO;
+        let mut t_update = std::time::Duration::ZERO;
         for it in 0..iter {
             debug!("build_with_metric_tree: iteration {}/{}", it + 1, iter);
+            let a = std::time::Instant::now();
             self.join();
+            t_join += a.elapsed();
+            let b = std::time::Instant::now();
             self.update();
+            t_update += b.elapsed();
         }
 
         debug!("build_with_metric_tree: extracting K={K} best neighbors");
+        let t = std::time::Instant::now();
         let mut final_graph: Vec<Vec<(usize, u32)>> = Vec::with_capacity(n);
         for node in 0..n {
             let neighbors = self.graph[node]
@@ -393,6 +436,17 @@ where
                 .map(|&(idx, dist, _)| (idx, dist))
                 .collect();
             final_graph.push(neighbors);
+        }
+        let t_extract = t.elapsed();
+
+        if profile {
+            eprintln!(
+                "[profile][nndescent/mt]   init(total)={:.3?}  join(sum/{} it)={:.3?} ({:.3?}/it)  update(sum)={:.3?} ({:.3?}/it)  extract={:.3?}",
+                t_init,
+                iter, t_join, t_join.checked_div(iter as u32).unwrap_or_default(),
+                t_update, t_update.checked_div(iter as u32).unwrap_or_default(),
+                t_extract,
+            );
         }
 
         debug!("build_with_metric_tree: done");
