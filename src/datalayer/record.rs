@@ -41,8 +41,6 @@ pub struct SimpleRecord<ID> {
     pub radix_key: String,
 }
 
-// FIXME
-// impl<ID: Clone> ApotheosisRecord for SimpleRecord<ID> {
 impl<ID: Clone + RadixKeyMapping> ApotheosisRecord for SimpleRecord<ID> {
     type MetricId = ID;
 

@@ -56,7 +56,7 @@ impl<const N: usize> Eq for HnswNode<N> {}
 // A node in the NSG data structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NsgNode {
-    pub feature_index: u32,
+    pub feature_index: u32, // Pointer to the data associated to this node
     pub neighbors: Vec<u32>,
     pub neighbor_distances: Vec<u32>,
 }
@@ -71,23 +71,8 @@ impl NsgNode {
     }
 
     #[inline]
-    pub fn active_neighbors(&self) -> &[u32] {
-        &self.neighbors
-    }
-
-    #[inline]
-    pub fn active_distances(&self) -> &[u32] {
-        &self.neighbor_distances
-    }
-
-    #[inline]
     pub fn neighbor_count(&self) -> usize {
         self.neighbors.len()
-    }
- 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.neighbors.is_empty()
     }
 }
 

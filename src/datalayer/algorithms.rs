@@ -25,10 +25,8 @@ pub trait Centroid: Sized + Clone {
     fn centroid(features: &[Self]) -> Self;
 }
 
-// We compute the medoid, a data point within the cluster that is the most 
-// representative and centrally located point, minimizing the average distance 
-// to all other points in the cluster. 
 impl Centroid for TlshDefault {
+    // Computes an approximate medoid over Tlsh features
     fn centroid(features: &[Self]) -> Self {
         let step = (features.len() / 256).max(1);
         let sample: Vec<&Self> = features.iter().step_by(step).collect();
@@ -41,8 +39,8 @@ impl Centroid for TlshDefault {
     }
 }
 
-// Again, we compute the medoid
 impl Centroid for u32 {
+    // Computes an approximate medoid over u32 features
     fn centroid(features: &[Self]) -> Self {
         let step = (features.len() / 256).max(1);
         let sample: Vec<&Self> = features.iter().step_by(step).collect();

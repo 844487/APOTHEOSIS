@@ -170,12 +170,12 @@ where
         // (idx, score) of every visited node
         let mut fullset: Vec<(usize, u32)> = Vec::new();
 
-        for neighbor in self.nnd_graph[enter_point].active_neighbors() {
+        for &neighbor in &self.nnd_graph[enter_point].neighbors {
             if knn_neighbors.len() >= ef {
                 break;
             }
 
-            let neighbor_feature_index = *neighbor as usize;
+            let neighbor_feature_index = neighbor as usize;
             scratch.mark(neighbor_feature_index);
             let score = self
                 .distance
@@ -205,8 +205,8 @@ where
             let (candidate, _, needs_expansion) = knn_neighbors[current_neighbor_to_expand];
             if needs_expansion {
                 knn_neighbors[current_neighbor_to_expand].2 = false;
-                for neighbor in self.nnd_graph[candidate].active_neighbors() {
-                    let neighbor_feature_index = *neighbor as usize;
+                for &neighbor in &self.nnd_graph[candidate].neighbors {
+                    let neighbor_feature_index = neighbor as usize;
                     if scratch.visit(neighbor_feature_index) {
                         let score = self
                             .distance
@@ -262,8 +262,8 @@ where
         let M = self.m;
         let C = self.c;
         let mut present: HashSet<usize> = candidates.iter().map(|&(idx, _)| idx).collect();
-        for neighbor in self.nnd_graph[node].active_neighbors() {
-            let neighbor_feature_index = *neighbor as usize;
+        for &neighbor in &self.nnd_graph[node].neighbors {
+            let neighbor_feature_index = neighbor as usize;
             if !present.insert(neighbor_feature_index) {
                 continue;
             }
@@ -404,27 +404,41 @@ where
         let mut cut_graph: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n];
         let mut scratch = SearchScratch::new(n);
         debug!("link: building NSG edges for {} nodes", n);
+        let profile = std::env::var("NSG_PROFILE").is_ok();
 
+        let t = std::time::Instant::now();
         for node in 0..n {
             let node_feature = self.features[node].clone();
             let (_, mut fullset) = self.get_neighbors(&node_feature, EF, &mut scratch);
             cut_graph[node] = self.sync_prune(node, &mut fullset);
         }
+        let t_prune = t.elapsed();
 
+        let t = std::time::Instant::now();
         for node in 0..n {
             let selected = std::mem::take(&mut cut_graph[node]);
             self.inter_insert(node, &selected, &mut cut_graph);
             cut_graph[node] = selected;
         }
+        let t_insert = t.elapsed();
 
         // Write cut_graph back into nnd_graph
         debug!("link: writing edges back into nnd_graph");
+        let t = std::time::Instant::now();
         for node in 0..n {
             let selected = &cut_graph[node];
             let node_entry = &mut self.nnd_graph[node];
 
             node_entry.neighbors = selected.iter().map(|&(idx, _)| idx as u32).collect();
             node_entry.neighbor_distances = selected.iter().map(|&(_, d)| d).collect();
+        }
+        let t_writeback = t.elapsed();
+
+        if profile {
+            eprintln!(
+                "[profile][nsg/link]   get_neighbors+sync_prune={:.3?}  inter_insert={:.3?}  writeback={:.3?}",
+                t_prune, t_insert, t_writeback,
+            );
         }
     }
 
@@ -464,7 +478,7 @@ where
         stack.push((root, 0));
 
         while let Some(&(node, cursor)) = stack.last() {
-            let neighbors = self.nnd_graph[node].active_neighbors();
+            let neighbors = &self.nnd_graph[node].neighbors;
             let mut next = None;
             let mut c = cursor;
             while c < neighbors.len() {
@@ -535,6 +549,7 @@ where
         self.c = cfg.nsg.c;
         self.ef = cfg.nsg.ef;
         let iter = cfg.iter;
+        let profile = std::env::var("NSG_PROFILE").is_ok();
 
         // Build KNN graph with NNDescent
         debug!("Building KNN graph with NNDescent (iter={iter})...");
@@ -549,9 +564,11 @@ where
             NndInit::Random => nnd.build(iter),
             NndInit::MetricTree => nnd.build_with_metric_tree(iter, n_trees, leaf_size),
         };
+        let t_nndescent = start.elapsed();
 
         debug!("Built in {:.3}s", start.elapsed().as_secs_f64());
 
+        let t = std::time::Instant::now();
         self.nnd_graph = built
             .iter()
             .enumerate()
@@ -562,22 +579,41 @@ where
                 node
             })
             .collect();
+        let t_convert = t.elapsed();
 
         debug!("build: loaded {} nodes from NNDescent", self.nnd_graph.len());
 
         debug!("build: computing navigating node");
+        let t = std::time::Instant::now();
         self.init_graph();
+        let t_init_graph = t.elapsed();
 
         debug!("build: linking graph (sync_prune + inter_insert)");
+        let t = std::time::Instant::now();
         self.link();
+        let t_link = t.elapsed();
 
         debug!("build: ensuring full connectivity");
+        let t = std::time::Instant::now();
         self.tree_grow();
+        let t_tree_grow = t.elapsed();
 
         let max = self.nnd_graph.iter().map(|n| n.neighbor_count()).max().unwrap_or(0);
         let min = self.nnd_graph.iter().map(|n| n.neighbor_count()).min().unwrap_or(0);
         let avg = self.nnd_graph.iter().map(|n| n.neighbor_count()).sum::<usize>() / self.nnd_graph.len();
         debug!("build: done — degree stats: max={max}, min={min}, avg={avg}");
+
+        if profile {
+            let total = t_nndescent + t_convert + t_init_graph + t_link + t_tree_grow;
+            let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(1e-9);
+            eprintln!("[profile][nsg] ===== build breakdown (n={}) =====", self.nnd_graph.len());
+            eprintln!("[profile][nsg]   nndescent (knn graph) = {:>10.3?}  ({:5.1}%)", t_nndescent, pct(t_nndescent));
+            eprintln!("[profile][nsg]   convert -> nnd_graph   = {:>10.3?}  ({:5.1}%)", t_convert, pct(t_convert));
+            eprintln!("[profile][nsg]   init_graph (entrypt)   = {:>10.3?}  ({:5.1}%)", t_init_graph, pct(t_init_graph));
+            eprintln!("[profile][nsg]   link (prune+insert)    = {:>10.3?}  ({:5.1}%)", t_link, pct(t_link));
+            eprintln!("[profile][nsg]   tree_grow (connect)    = {:>10.3?}  ({:5.1}%)", t_tree_grow, pct(t_tree_grow));
+            eprintln!("[profile][nsg]   TOTAL build            = {:>10.3?}", total);
+        }
 
         Ok(())
     }
@@ -591,12 +627,12 @@ where
 
         let enter_point = self.navigating_node as usize;
 
-        for neighbor in self.nnd_graph[enter_point].active_neighbors() {
+        for &neighbor in &self.nnd_graph[enter_point].neighbors {
             if knn_neighbors.len() >= ef {
                 break;
             }
 
-            let neighbor_feature_index = *neighbor as usize;
+            let neighbor_feature_index = neighbor as usize;
             scratch.mark(neighbor_feature_index);
             let score = self
                 .distance
@@ -626,8 +662,8 @@ where
             if needs_expansion {
                 knn_neighbors[current_neighbor_to_expand].2 = false;
 
-                for neighbor in self.nnd_graph[candidate].active_neighbors() {
-                    let neighbor_feature_index = *neighbor as usize;
+                for &neighbor in &self.nnd_graph[candidate].neighbors {
+                    let neighbor_feature_index = neighbor as usize;
                     if scratch.visit(neighbor_feature_index) {
                         let score = self
                             .distance
@@ -681,7 +717,7 @@ where
         for node in &self.nnd_graph {
             buf4 = (node.neighbor_count() as u32).to_le_bytes();
             file.write_all(&buf4)?;
-            for &nb in node.active_neighbors() {
+            for &nb in &node.neighbors {
                 file.write_all(&nb.to_le_bytes())?;
             }
         }
@@ -736,17 +772,17 @@ where
 
         let node = &self.nnd_graph[index];
 
-        let neigbors = node.active_neighbors();
+        let neigbors = &node.neighbors;
 
-        for neighbor_index in neigbors {
+        for &neighbor_index in neigbors {
             let score = self.distance.calculate_distance(
-                &self.features[*neighbor_index as usize],
+                &self.features[neighbor_index as usize],
                 &self.features[node.feature_index as usize],
             );
             results.push((
                 score,
-                *neighbor_index as usize,
-                &self.features[*neighbor_index as usize],
+                neighbor_index as usize,
+                &self.features[neighbor_index as usize],
             ));
         }
 
