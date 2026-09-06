@@ -1,13 +1,13 @@
-// FIXME
 use crate::datalayer::record::{RadixKeyMapping};
 
 use crate::controllers::nsg::{BuildConfig, Nsg};
 use crate::controllers::radix_tree::RadixNode;
 use crate::datalayer::algorithms::DistanceAlgorithm;
-use crate::datalayer::algorithms::Centroid;
+use crate::datalayer::algorithms::Medoid;
 use crate::datalayer::record::ApotheosisRecord;
 // use gexf::{Edge, EdgeType, Gexf, Node as GefxNode};
-use std::fs::{self};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -31,7 +31,7 @@ impl<R, D> Apotheosis<R, D>
 where
     R: ApotheosisRecord,
     D: DistanceAlgorithm<R::MetricId> + Default,
-    R::MetricId: Centroid
+    R::MetricId: Medoid
 {
 
     pub fn new(config: BuildConfig) -> Self {
@@ -43,26 +43,39 @@ where
         }
     }
 
-    pub fn insert(&mut self, records: Vec<R>) -> bool {
-        let features: Vec<R::MetricId> = records    
-            .iter()
-            .map(|r| r.search_id())
-            .collect();
+    pub fn set_seed(&mut self, seed: u64) {
+        self.config.seed = seed;
+        self.nsg.set_seed(seed);
+    }
 
-        self.records = records;
+    pub fn insert(&mut self, records: Vec<R>) -> bool {
+        self.records = Vec::with_capacity(records.len());
+        let mut features: Vec<R::MetricId> = Vec::with_capacity(records.len());
+
+        for record in records {
+            let feature = record.search_id();
+
+            match feature.to_radix_key() {
+                Some(key) => {
+                    if self.radix.find(&key).is_some() {
+                        // println!("Key already exists in radix tree: {:?}", key);
+                        continue;
+                    }
+
+                    let index = self.records.len();
+                    self.radix.insert(key, Some(index));
+                    features.push(feature);
+                    self.records.push(record);
+                }
+                None => {
+                    features.push(feature);
+                    self.records.push(record);
+                }
+            }
+        }
 
         let cfg = self.config;
         let _ = self.nsg.build(features, &cfg);
-
-        for (index, record) in self.records.iter().enumerate() {
-            if let Some(key) = record.search_id().to_radix_key() {
-                if self.radix.find(&key).is_some() {
-                    println!("Key already exists in radix tree: {:?}", key);
-                    continue;
-                }
-                self.radix.insert(key, Some(index));
-            }
-        }
 
         true
     }
@@ -80,7 +93,7 @@ where
     ///   - `u32`: Distance/score to the query
     ///   - `&R`: Reference to the actual retrieved Record item
     pub fn search(
-        &mut self, // FIXME: self must be a mutable reference
+        &mut self,
         query: &R::MetricId,
         k: usize,
         ef_search: Option<usize>,
@@ -90,9 +103,13 @@ where
         let nsg_results: Vec<(u32, usize, &R::MetricId)> = if let Some(key) = query.to_radix_key() {
             if let Some(radix_node) = self.radix.find(&key) {
                 if let Some(Some(node_index)) = radix_node.data {
-                    // TODO: This does not work as expected. It returs the
-                    // NSG neighbors (which are not necessarily the closests)
-                    self.nsg.get_neighbors_node(node_index)
+                    let mut results = self.nsg.knn_search(query, k, ef_search);
+                    if !results.iter().any(|&(_, i, _)| i == node_index) {
+                        results.insert(0, (0, node_index, query));
+                        results.truncate(k);
+                    }
+
+                    results
                 } else {
                     self.nsg.knn_search(query, k, ef_search)
                 }
@@ -114,8 +131,27 @@ where
     where
         Self: serde::Serialize,
     {
-        let encoded = bincode::serialize(self)?;
-        fs::write(path, encoded)?;
+        let mut file = File::create(path)?;
+        file.write_all(b"APOT")?;
+        bincode::serialize_into(file, self)?;
         Ok(())
     }
+
+    /// Loads a model previously written by `dump`.
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        Self: serde::de::DeserializeOwned,
+    {
+        let mut file = File::open(path)?;
+
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        if &magic != b"APOT" {
+            return Err("Invalid Apotheosis model file (missing magic bytes)".into());
+        }
+
+        let model = bincode::deserialize_from(file)?;
+        Ok(model)
+    }
 }
+

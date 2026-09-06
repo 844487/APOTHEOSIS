@@ -1,5 +1,5 @@
 use crate::datalayer::algorithms::DistanceAlgorithm;
-use crate::datalayer::algorithms::Centroid;
+use crate::datalayer::algorithms::Medoid;
 use crate::datalayer::nodes::NsgNode;
 use crate::controllers::nndescent::NNDescent;
 use rand::rngs::StdRng;
@@ -13,7 +13,7 @@ fn default_rng() -> StdRng {
     StdRng::seed_from_u64(42)
 }
 
-/// Reusable visited-set for a search
+// Reusable visited-set for a search
 #[derive(Default)]
 pub struct SearchScratch {
     visited: Vec<u32>,
@@ -44,7 +44,7 @@ impl SearchScratch {
         self.visited[idx] = self.epoch;
     }
 
-    /// True if `idx` was newly visited
+    // True if `idx` was newly visited
     #[inline]
     fn visit(&mut self, idx: usize) -> bool {
         if self.visited[idx] != self.epoch {
@@ -62,17 +62,18 @@ pub enum NndInit {
     MetricTree,
 }
 
-/// Runtime NSG structural sizes (see the comment on the `Nsg` struct)
+// Runtime NSG structural sizes (see the comment on the `Nsg` struct)
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NsgParams {
     pub m: usize,
     pub c: usize,
     pub ef: usize,
+    pub alpha: f32,
 }
 
 impl Default for NsgParams {
     fn default() -> Self {
-        Self { m: 16, c: 500, ef: 400 }
+        Self { m: 16, c: 500, ef: 400, alpha: 1.2 }
     }
 }
 
@@ -84,6 +85,7 @@ pub struct BuildConfig {
     pub iter: usize,
     pub n_trees: usize,
     pub leaf_size: usize,
+    pub seed: u64,
 }
 
 impl Default for BuildConfig {
@@ -95,13 +97,14 @@ impl Default for BuildConfig {
             iter: 10,
             n_trees: 16,
             leaf_size: 32,
+            seed: 42,
         }
     }
 }
 
-// M: max out-degree (R in the reference NSG)
-// C: max candidates considered in sync prune
-// EF: candidate pool size for greedy search
+// m: max out-degree
+// c: max candidates considered in sync prune
+// ef: candidate pool size for greedy search
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(bound(
     serialize = "ID: serde::Serialize, D: DistanceAlgorithm<ID> + serde::Serialize",
@@ -118,7 +121,7 @@ where
     #[serde(skip, default = "default_rng")]
     prng: StdRng,
     distance: D,
-    alpha: f32, // TODO: Move this
+    alpha: f32,
     m: usize,
     c: usize,
     ef: usize,
@@ -138,7 +141,7 @@ where
             navigating_node: usize::MAX,
             prng: StdRng::seed_from_u64(42),
             distance: D::default(),
-            alpha: 1.2,
+            alpha: p.alpha,
             m: p.m,
             c: p.c,
             ef: p.ef,
@@ -150,9 +153,17 @@ where
         self.ef
     }
 
+    pub fn set_seed(&mut self, seed: u64) {
+        self.prng = StdRng::seed_from_u64(seed);
+    }
+
     #[inline]
     fn random_node(&mut self) -> usize {
         let n = self.features.len();
+        if n == 0 {
+            return usize::MAX;
+        }
+
         self.prng.next_u64() as usize % n
     }
 
@@ -245,10 +256,10 @@ where
 
     fn init_graph(&mut self)
     where
-        ID: Centroid,
+        ID: Medoid,
     {
         let EF = self.ef;
-        let center = ID::centroid(&self.features);
+        let center = ID::medoid(&self.features);
         self.navigating_node = self.random_node();
         debug!("init_graph: random entry point → {}", self.navigating_node);
         let results = self.knn_search(&center, 1, EF);
@@ -542,12 +553,30 @@ where
 
     pub fn build(&mut self, features: Vec<ID>, cfg: &BuildConfig) -> std::io::Result<()>
     where
-        ID: Centroid,
+        ID: Medoid,
     {
         self.features = features;
         self.m = cfg.nsg.m;
         self.c = cfg.nsg.c;
         self.ef = cfg.nsg.ef;
+        self.alpha = if cfg.nsg.alpha.is_finite() && cfg.nsg.alpha > 0.0 {
+            cfg.nsg.alpha
+        } else {
+            let fallback = NsgParams::default().alpha;
+            debug!(
+                "build: ignoring invalid alpha={} — using the default {}",
+                cfg.nsg.alpha, fallback
+            );
+            fallback
+        };
+        self.prng = StdRng::seed_from_u64(cfg.seed);
+
+        if self.features.is_empty() {
+            self.nnd_graph.clear();
+            self.navigating_node = usize::MAX;
+            return Ok(());
+        }
+
         let iter = cfg.iter;
         let profile = std::env::var("NSG_PROFILE").is_ok();
 
@@ -557,7 +586,7 @@ where
         // let mut nnd = NNDescent::<D, ID, 50, 400, 10, 200>::new(&self.features);
         // let built = nnd.build(iter);
 
-        let mut nnd = NNDescent::<D, ID>::new(&self.features, cfg.nnd);
+        let mut nnd = NNDescent::<D, ID>::new_with_seed(&self.features, cfg.nnd, cfg.seed);
         // VP-tree initialisation parameters: number of randomized trees and leaf size
         let (n_trees, leaf_size) = (cfg.n_trees, cfg.leaf_size);
         let built = match cfg.init {
@@ -619,6 +648,10 @@ where
     }
 
     pub fn knn_search(&mut self, query_id: &ID, k: usize, ef: usize) -> Vec<(u32, usize, &ID)> {
+        if self.features.is_empty() {
+            return Vec::new();
+        }
+
         let mut scratch = SearchScratch::new(self.features.len());
         scratch.begin(self.features.len());
 
@@ -641,7 +674,7 @@ where
             knn_neighbors.insert(pos, (neighbor_feature_index, score, true));
         }
 
-        let ef = ef.min(self.features.len());
+        let ef = ef.max(k).min(self.features.len());
         while knn_neighbors.len() < ef {
             let neighbor_feature_index = self.random_node();
             if scratch.visit(neighbor_feature_index) {
@@ -697,97 +730,5 @@ where
             .map(|(index, distance, _)| (distance, index, &self.features[index]))
             .collect()
     }
-
-    pub fn save(&self, path: &str) -> std::io::Result<()> {
-        use std::io::Write;
-
-        let M = self.m;
-        let mut file = std::fs::File::create(path)?;
-        let mut buf4;
-
-        // width (M)
-        buf4 = (M as u32).to_le_bytes();
-        file.write_all(&buf4)?;
-
-        // navigating_node (ep_)
-        buf4 = (self.navigating_node as u32).to_le_bytes();
-        file.write_all(&buf4)?;
-
-        // for each node: k + neighbors
-        for node in &self.nnd_graph {
-            buf4 = (node.neighbor_count() as u32).to_le_bytes();
-            file.write_all(&buf4)?;
-            for &nb in &node.neighbors {
-                file.write_all(&nb.to_le_bytes())?;
-            }
-        }
-
-        debug!("save: wrote {} nodes to {}", self.nnd_graph.len(), path);
-        Ok(())
-    }
-
-    pub fn load(&mut self, path: &str) -> std::io::Result<()> {
-        use std::io::Read;
-
-        let M = self.m;
-        let mut file = std::fs::File::open(path)?;
-        let mut buf4 = [0u8; 4];
-
-        file.read_exact(&mut buf4)?;
-        let width = u32::from_le_bytes(buf4) as usize;
-        debug!("load: width={width}");
-        if width != M {
-            debug!("load: note — graph was built with R={width}, current M={M}");
-        }
-
-        file.read_exact(&mut buf4)?;
-        self.navigating_node = u32::from_le_bytes(buf4) as usize;
-        debug!("load: navigating_node={}", self.navigating_node);
-
-        self.nnd_graph.clear();
-        loop {
-            if file.read_exact(&mut buf4).is_err() { break; }
-            let k = u32::from_le_bytes(buf4) as usize;
-
-            let mut node = NsgNode::new_empty(self.nnd_graph.len() as u32);
-            node.neighbors.reserve(k);
-            node.neighbor_distances.reserve(k);
-
-            for _ in 0..k {
-                file.read_exact(&mut buf4)?;
-                let nb = u32::from_le_bytes(buf4);
-                node.neighbors.push(nb);
-                node.neighbor_distances.push(u32::MAX);
-            }
-            self.nnd_graph.push(node);
-        }
-
-        debug!("load: loaded {} nodes", self.nnd_graph.len());
-        Ok(())
-    }
-
-    // TODO: Rethink this
-    pub fn get_neighbors_node(&self, index: usize) -> Vec<(u32, usize, &ID)> {
-        let mut results: Vec<(u32, usize, &ID)> = vec![];
-
-        let node = &self.nnd_graph[index];
-
-        let neigbors = &node.neighbors;
-
-        for &neighbor_index in neigbors {
-            let score = self.distance.calculate_distance(
-                &self.features[neighbor_index as usize],
-                &self.features[node.feature_index as usize],
-            );
-            results.push((
-                score,
-                neighbor_index as usize,
-                &self.features[neighbor_index as usize],
-            ));
-        }
-
-        results.insert(0, (0, index, &self.features[index]));
-
-        results
-    }
 }
+

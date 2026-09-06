@@ -1,38 +1,42 @@
 // =============================================================================
-// NSG recall/latency benchmark — "exams" dataset (flat file_hashes.json), TLSH
+// NSG recall/latency benchmark — "windows" dataset (directory tree), TLSH
 // =============================================================================
 //
 // Overview
-//   Indexes a slice of TLSH hashes into the APOTHEOSIS / NSG model, runs a set
-//   of queries, and measures recall against a brute-force ground truth.
+//   Walks the windows-dataset tree, extracts TLSH hashes, indexes a slice into
+//   the APOTHEOSIS / NSG model, queries it, and measures recall against a
+//   brute-force ground truth.
 //
 //   With --model-cache the built model is dumped to disk and reused on the next
 //   run that requests the same build config, replacing a rebuild with a load.
-//   This is what makes the ef-search sweep cheap: the first ef-search point
-//   builds and dumps the model; the remaining points load it.
+//   The first ef-search point of a config builds and dumps the model; the
+//   remaining points load it.
+//
+//   The engine matches the NSG test_tlsh_exams binary; only the dataset reader
+//   differs. Here --dataset is a directory walked recursively for *.json files
+//   (a single JSON file is also accepted), and the reader tolerates both the
+//   flat-array layout and the keyed-object layout (see extract_from_value).
+//   --field falls back to "TLSH" when "tlsh_hash_bytes" is requested but absent.
 //
 // Cache integrity
 //   Each cache (model, brute, hash) has a companion "<file>.fp" sidecar holding
 //   a stable FNV-1a fingerprint of the data it was derived from:
 //     * model .fp  fingerprint of the indexed slice
 //     * brute .fp  fingerprint of (indexed slice, query slice)
-//     * hash  .fp  signature of the dataset file on disk (path, length, mtime)
+//     * hash  .fp  signature of every *.json file in the tree (path, length, mtime)
 //   The fingerprint is verified on load; a mismatch forces a rebuild or
 //   recompute rather than trusting a same-shaped but incorrect cache. A missing
-//   sidecar (for example, a cache written by an older build, or by the HNSW
-//   binary before it was updated) is accepted by shape, with a warning, and a
-//   sidecar is then written so subsequent runs are protected. The brute and hash
-//   caches are shared with the HNSW harness, so the HNSW binary must use the
-//   same fingerprint functions (see MIGRATION_NOTES) for the cross-tool sharing
-//   to remain safe.
+//   sidecar is accepted by shape, with a warning, and one is then written. The
+//   brute and hash caches are shared with the HNSW harness, so the HNSW binary
+//   must use the same fingerprint functions (see MIGRATION_NOTES) for the
+//   cross-tool sharing to remain safe.
 //
 // Timing
 //   The search is timed over --repeats passes (default 1) and the reported
-//   nsg_ms is the median, with an optional untimed --warmup pass. creation_ms
-//   and brute_ms are single measurements whose meaning depends on whether the
-//   cache was hit, so the RESULT line also carries model_cached and brute_cached
-//   flags (0/1) to distinguish "built" from "loaded". A derived qps column is
-//   emitted for convenience.
+//   nsg_ms is the median, with an optional untimed --warmup pass. The RESULT
+//   line carries model_cached and brute_cached flags (0/1) so that creation_ms
+//   and brute_ms can be read as either a build/compute time or a cache-load
+//   time, alongside a derived qps column.
 //
 // Harness interface
 //   The sweep harness (scripts/lib_nsg.sh) invokes this binary once per
@@ -44,10 +48,8 @@
 //            model_cached,brute_cached,repeats,qps
 //
 //   All other output is written to stderr. The RESULT columns and their order
-//   must stay in sync with the CSV header in lib_nsg.sh.
-//
-//   Column-name note: recall_at_k and genuine_miss are complementary (they sum
-//   to 1); exact_same (exact-item recall) is independent of both.
+//   must stay in sync with the CSV header in lib_nsg.sh (identical to the NSG
+//   exams binary).
 //
 // Parameter groups (all runtime flags; nothing is compile-time)
 //   build mode : --init {random|metric-tree}, --iter, --n-trees, --leaf-size
@@ -63,16 +65,15 @@
 //   search     : --search-k, --ef-search (omit to reuse the build --ef)
 //   timing     : --repeats (median over N passes), --warmup
 //   sampling   : --shuffle/--seed (representative sample), --dedup
-//   caching    : --hash-cache (skip JSON parse), --brute-cache, --model-cache, --rescan
+//   caching    : --hash-cache (skip the tree walk), --brute-cache, --model-cache, --rescan
 //
 // Recall definitions (mean over queries, each in [0, 1])
 //   distance-recall@k : fraction of returned items within the k-th true distance
 //                       (tie-tolerant).
 //   exact-item recall : additionally requires the returned point to be a true
-//                       top-k point (compared by hash bytes, so duplicates of
-//                       the right hash still count).
+//                       top-k point (compared by hash bytes).
 //
-// Help:  cargo run --release --bin test_tlsh_exams -- --help
+// Help:  cargo run --release --bin test_tlsh_windows -- --help
 
 use apotheosis3::controllers::apotheosis::Apotheosis;
 use apotheosis3::controllers::nndescent::NndParams;
@@ -83,7 +84,7 @@ use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 use rayon::prelude::*;
@@ -107,16 +108,10 @@ impl From<InitArg> for NndInit {
 }
 
 // ---------------------------------------------------------------------------
-// Determinism and cache-integrity helpers.
-//   * SplitMix64  a fully specified PRNG that keeps --shuffle reproducible
-//                 across compilers, rand versions, and both the NSG and HNSW
-//                 crates.
-//   * FNV-1a      a stable content hash. std's DefaultHasher is not stable
-//                 across Rust versions and must not be used for a cross-build
-//                 cache key.
-//   * .fp sidecar every cache (model, brute, hash) has a companion <file>.fp
-//                 holding a hex fingerprint, verified on load; a mismatch is
-//                 refused.
+// Determinism and cache-integrity helpers, identical to the exams binary and
+// kept in sync with it. SplitMix64 is the stable PRNG for --shuffle; FNV-1a is
+// the stable content hash used for cache fingerprints; the .fp sidecars hold
+// those fingerprints.
 // ---------------------------------------------------------------------------
 
 struct SplitMix64(u64);
@@ -182,47 +177,29 @@ fn median(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Cheap dataset signature: path + length + mtime of the dataset file. Detects a
-/// regenerated dataset on disk (which would invalidate a hash cache) without
-/// re-reading the file. mtime-based, so it errs on the safe side: a touched file
-/// forces a rescan rather than risking a stale cache.
-fn dataset_signature(path: &str) -> u64 {
-    let mut h = FNV_OFFSET;
-    h = fnv1a64(path.as_bytes(), h);
-    if let Ok(md) = fs::metadata(path) {
-        h = fnv1a64(&md.len().to_le_bytes(), h);
-        if let Ok(t) = md.modified() {
-            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                h = fnv1a64(&d.as_secs().to_le_bytes(), h);
-            }
-        }
-    }
-    h
-}
-
-/// Benchmark APOTHEOSIS + NSG on a flat JSON array of TLSH hashes (file_hashes.json).
+/// Benchmark APOTHEOSIS + NSG on the windows-dataset TLSH hashes.
 #[derive(Parser, Debug)]
-#[command(name = "test_tlsh", about = "Tune build modes/params and measure recall@k vs brute force (TLSH)")]
+#[command(name = "test_tlsh_windows", about = "Tune build modes/params and measure recall@k vs brute force (TLSH)")]
 struct Args {
-    /// Flat JSON file: an array of objects each with a TLSH field.
-    #[arg(long, default_value = "file_hashes.json")]
+    /// Dataset path. Either a directory (walked recursively for *.json) or a single JSON file.
+    #[arg(long, default_value = "windows-dataset")]
     dataset: String,
-    /// JSON field holding the TLSH hash in each object.
-    #[arg(long, default_value = "TLSH")]
+    /// JSON field holding the TLSH hash inside each function object.
+    #[arg(long, default_value = "tlsh_hash_bytes")]
     field: String,
-    /// Drop duplicate hashes.
+    /// Drop duplicate hashes (function-level data has many identical hashes).
     #[arg(long, default_value_t = false)]
     dedup: bool,
     /// Shuffle the full hash list (seeded) before slicing dataset/queries, so the
     /// indexed set and queries are a representative sample rather than the first
-    /// records in file order.
+    /// directories in traversal order.
     #[arg(long, default_value_t = false)]
     shuffle: bool,
     /// RNG seed for --shuffle (fixed so runs are reproducible).
     #[arg(long, default_value_t = 42)]
     seed: u64,
     /// Number of dataset points to index (0 = use all available).
-    #[arg(long, default_value_t = 42000)]
+    #[arg(long, default_value_t = 100000)]
     dataset_size: usize,
     /// First query index (defaults to dataset_size, i.e. disjoint from the dataset).
     #[arg(long)]
@@ -249,11 +226,10 @@ struct Args {
     /// load it instead of building; otherwise build and write it here.
     #[arg(long)]
     model_cache: Option<String>,
-    /// Cache file for the extracted + validated hash list. Only used when given;
-    /// without it the dataset is always re-read (no auto-cache is written).
+    /// Cache file for the extracted + validated hash list (auto-derived if omitted).
     #[arg(long)]
     hash_cache: Option<String>,
-    /// Force a re-read of the dataset, ignoring any existing hash cache.
+    /// Force a re-scan of the dataset tree, ignoring any existing hash cache.
     #[arg(long, default_value_t = false)]
     rescan: bool,
 
@@ -302,39 +278,123 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// Dataset reading: pull the TLSH field out of the flat JSON (array, or a keyed
-// object) and keep only strings that parse as valid TLSH hashes.
+// Dataset reading: walk the tree for *.json, pull the TLSH field (with a "TLSH"
+// fallback) from either JSON layout, and keep only valid TLSH hash strings.
 // ---------------------------------------------------------------------------
 
-fn push_field(obj: &Value, field: &str, out: &mut Vec<String>) {
-    if let Some(s) = obj.get(field).and_then(|x| x.as_str()) {
+/// Recursively collect every *.json file under `root` (or just `root` if it is a file).
+/// Sorted for deterministic dataset ordering.
+fn collect_json_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return out;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Cheap dataset signature over every *.json file in the tree: path + length +
+/// mtime, stat-only (no file reads). Detects a regenerated dataset on disk
+/// (which would invalidate a hash cache) far more cheaply than re-extracting.
+/// mtime-based, so it errs on the safe side: touched files force a rescan.
+fn dataset_signature(root: &Path) -> u64 {
+    let files = collect_json_files(root); // already sorted -> stable order
+    let mut h = FNV_OFFSET;
+    h = fnv1a64(&(files.len() as u64).to_le_bytes(), h);
+    for f in &files {
+        h = fnv1a64(f.to_string_lossy().as_bytes(), h);
+        if let Ok(md) = fs::metadata(f) {
+            h = fnv1a64(&md.len().to_le_bytes(), h);
+            if let Ok(t) = md.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    h = fnv1a64(&d.as_secs().to_le_bytes(), h);
+                }
+            }
+        }
+        h = fnv1a64(&[0xff], h);
+    }
+    h
+}
+
+/// Pull `field` (or `fallback`) out of a single JSON value if it looks like a hash string.
+fn push_field(obj: &Value, field: &str, fallback: Option<&str>, out: &mut Vec<String>) {
+    let val = obj
+        .get(field)
+        .and_then(|x| x.as_str())
+        .or_else(|| fallback.and_then(|f| obj.get(f)).and_then(|x| x.as_str()));
+    if let Some(s) = val {
         if !s.is_empty() && s != "TNULL" {
             out.push(s.to_string());
         }
     }
 }
 
-fn read_hashes(path: &str, field: &str, dedup: bool) -> Vec<String> {
-    let data = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Failed to read JSON file {path}: {e}"));
-    let v: Value = serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse JSON {path}: {e}"));
-    let mut out = Vec::new();
-    match &v {
+/// Handle both shapes:
+///   * flat array `[ { "tlsh_hash_bytes": ... }, ... ]` (old `file_hashes.json` style with "TLSH")
+///   * keyed object `{ "file": "...", "fcn.x": { "tlsh_hash_bytes": ... }, ... }` (windows-dataset)
+fn extract_from_value(v: &Value, field: &str, fallback: Option<&str>, out: &mut Vec<String>) {
+    match v {
         Value::Array(arr) => {
             for item in arr {
-                push_field(item, field, &mut out);
+                push_field(item, field, fallback, out);
             }
         }
-        // Tolerate a keyed object too ({ name -> record }).
         Value::Object(map) => {
-            for val in map.values() {
-                push_field(val, field, &mut out);
+            if map.contains_key(field) || fallback.map_or(false, |f| map.contains_key(f)) {
+                // The object is itself a single record.
+                push_field(v, field, fallback, out);
+            } else {
+                // It is a map of {name -> record}; the "file" string value is skipped
+                // automatically because it has no `field`.
+                for val in map.values() {
+                    push_field(val, field, fallback, out);
+                }
             }
         }
         _ => {}
     }
+}
+
+fn read_hashes(root: &Path, field: &str, dedup: bool) -> Vec<String> {
+    let files = collect_json_files(root);
+    eprintln!("Scanning {} JSON file(s) under {}", files.len(), root.display());
+    let mut out = Vec::new();
+    // "TLSH" fallback keeps the old flat-array dataset working unchanged.
+    let fallback = if field == "tlsh_hash_bytes" { Some("TLSH") } else { None };
+    for f in &files {
+        let data = match fs::read_to_string(f) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Skipping {}: {e}", f.display());
+                continue;
+            }
+        };
+        extract_from_value(&v, field, fallback, &mut out);
+    }
+
+    // Keep only hashes the TLSH parser actually accepts (avoids panics later).
     out.retain(|s| TlshDefault::from_str(s).is_ok());
+
     if dedup {
         let mut seen = HashSet::new();
         out.retain(|s| seen.insert(s.clone()));
@@ -345,19 +405,21 @@ fn read_hashes(path: &str, field: &str, dedup: bool) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Hash-list cache: active only when --hash-cache is given. In that case the
 // extracted and validated list is cached to that file so repeated runs skip the
-// JSON parse; --rescan bypasses a stale one. A "<cache>.fp" sidecar stores the
-// dataset signature, so a dataset regenerated on disk (same path) forces a
-// rescan even without --rescan. Without --hash-cache the dataset is always
-// re-read and no cache is written.
+// directory walk and JSON parse; --rescan bypasses a stale one. A "<cache>.fp"
+// sidecar stores the dataset signature, so a tree regenerated on disk forces a
+// rescan even without --rescan. Without --hash-cache the tree is always
+// re-scanned and no cache is written.
 // ---------------------------------------------------------------------------
 
+/// Load the extracted hash list from a flat newline-delimited cache (only when
+/// --hash-cache is set), or scan the dataset tree.
 fn load_or_scan_hashes(args: &Args) -> Vec<String> {
     let cache = match &args.hash_cache {
         Some(p) => p.clone(),
-        None => return read_hashes(&args.dataset, &args.field, args.dedup),
+        None => return read_hashes(Path::new(&args.dataset), &args.field, args.dedup),
     };
     let sig_path = format!("{cache}.fp");
-    let sig_now = dataset_signature(&args.dataset);
+    let sig_now = dataset_signature(Path::new(&args.dataset));
     if !args.rescan && Path::new(&cache).exists() {
         if let Ok(data) = fs::read_to_string(&cache) {
             let v: Vec<String> = data.lines().map(|l| l.to_string()).collect();
@@ -368,7 +430,7 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
                         return v;
                     }
                     Some(_) => {
-                        eprintln!("Hash cache {cache} is stale (dataset changed on disk) — rescanning");
+                        eprintln!("Hash cache {cache} is stale (dataset tree changed on disk) — rescanning");
                     }
                     None => {
                         eprintln!(
@@ -384,7 +446,7 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
             }
         }
     }
-    let v = read_hashes(&args.dataset, &args.field, args.dedup);
+    let v = read_hashes(Path::new(&args.dataset), &args.field, args.dedup);
     match fs::write(&cache, v.join("\n")) {
         Ok(_) => {
             eprintln!("Saved {} hashes to {cache}", v.len());
@@ -396,10 +458,10 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force ground truth: exact top-k per query, cached to disk so every
-// (build config, ef_search) point reuses it. Validated by a "<path>.fp" sidecar
-// holding the fingerprint of (dataset, queries), so a same-shaped but wrong
-// cache (different data, seed, or extraction order) can never be reused.
+// Brute-force ground truth: exact top-k per query, computed in parallel (rayon)
+// and cached to disk so every (build config, ef_search) point reuses it.
+// Validated by a "<path>.fp" sidecar holding the fingerprint of (dataset,
+// queries), so a same-shaped but wrong cache can never be reused.
 // ---------------------------------------------------------------------------
 
 fn create_tlsh_object(hash: &str) -> TlshDefault {
@@ -507,9 +569,7 @@ fn load_or_compute_brute(
 // ---------------------------------------------------------------------------
 // Model cache: load a previously dumped model if one exists at --model-cache and
 // its indexed count and fingerprint match; otherwise build it and dump it there
-// (with a "<path>.fp" sidecar). lib_nsg.sh keys the path on the build-config
-// slug and invalidates any dump older than the freshly compiled binary, so a
-// recompile triggers a rebuild.
+// (with a "<path>.fp" sidecar).
 // ---------------------------------------------------------------------------
 
 fn load_or_build_model(
@@ -572,8 +632,9 @@ fn load_or_build_model(
 }
 
 // ---------------------------------------------------------------------------
-// Entry point: assemble the build config, load + slice the data, build the NSG
-// index, compute/reuse ground truth, run the search, score recall, print RESULT.
+// Entry point: assemble the build config; load (from cache or by scanning),
+// optionally shuffle, and slice the data; build the NSG index; compute or reuse
+// the ground truth; run the search; score recall; print RESULT.
 // ---------------------------------------------------------------------------
 pub fn main() {
     let args = Args::parse();
@@ -619,7 +680,7 @@ pub fn main() {
     };
     let query_start = args.query_start.unwrap_or(dataset_size).min(n_total);
     let query_end = (query_start + args.query_count).min(n_total);
-    assert!(dataset_size > 0, "no usable TLSH hashes found in {}", args.dataset);
+    assert!(dataset_size > 0, "no usable TLSH hashes found under {}", args.dataset);
 
     let dataset: Vec<String> = hashes[..dataset_size].to_vec();
     let queries: Vec<String> = hashes[query_start..query_end].to_vec();
@@ -662,8 +723,7 @@ pub fn main() {
     );
 
     // Content fingerprints for cache integrity (stable FNV-1a over the sliced
-    // hash strings). The model dump is keyed on the indexed slice; the brute
-    // truth on the indexed and query slices.
+    // hash strings).
     let model_fp = fingerprint_slices(&[dataset.as_slice()]);
     let brute_fp = fingerprint_slices(&[dataset.as_slice(), queries.as_slice()]);
 
@@ -697,8 +757,7 @@ pub fn main() {
         }
     }
     let mut nsg_times_ms: Vec<f64> = Vec::with_capacity(repeats);
-    // Approx top-k per query, kept from the first pass for scoring (the search is
-    // deterministic, so every pass yields the same result set).
+    // Approx top-k per query, kept from the first pass for scoring (deterministic).
     let mut approx: Vec<Vec<(u32, Vec<u8>)>> = Vec::new();
     for r in 0..repeats {
         let start = Instant::now();
@@ -773,7 +832,7 @@ pub fn main() {
         nsg_ms, repeats, qps
     );
 
-    // Machine-readable line for the sweep harness (stdout).
+    // Machine-readable line for the sweep harness (stdout). Columns identical to the NSG exams binary.
     println!(
         "RESULT,{init},{iter},{ntrees},{leaf},{m},{c},{ef},{alpha},{k},{l},{s},{r},\
          {dsize},{nq},{sk},{effef},{recall:.6},{exact:.6},{miss:.6},\

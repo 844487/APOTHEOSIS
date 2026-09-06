@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use tlsh2::TlshDefault;
+use crate::datalayer::algorithms::SsdeepHash;
 
 /// Trait for Metric types (like TLSH or numerical IDs) to specify if they natively map to a Radix Tree exact-match key.
 pub trait RadixKeyMapping {
@@ -17,6 +18,12 @@ impl RadixKeyMapping for TlshDefault {
 impl RadixKeyMapping for u32 {
     fn to_radix_key(&self) -> Option<Vec<u8>> {
         Some(self.to_string().into_bytes())
+    }
+}
+
+impl RadixKeyMapping for SsdeepHash {
+    fn to_radix_key(&self) -> Option<Vec<u8>> {
+        Some(self.0.clone().into_bytes())
     }
 }
 
@@ -51,6 +58,7 @@ impl<ID: Clone + RadixKeyMapping> ApotheosisRecord for SimpleRecord<ID> {
 
 pub type SimpleNumberRecord = SimpleRecord<u32>;
 pub type SimpleTlshRecord = SimpleRecord<TlshDefault>;
+pub type SimpleSsdeepRecord = SimpleRecord<SsdeepHash>;
 
 impl SimpleNumberRecord {
     pub fn create(s: String) -> Self {
@@ -62,6 +70,13 @@ impl SimpleNumberRecord {
 impl SimpleTlshRecord {
     pub fn create(s: String) -> Self {
         let id = TlshDefault::from_str(&s).unwrap();
+        Self { id, radix_key: s }
+    }
+}
+
+impl SimpleSsdeepRecord {
+    pub fn create(s: String) -> Self {
+        let id = SsdeepHash(s.clone());
         Self { id, radix_key: s }
     }
 }

@@ -1,38 +1,42 @@
 // =============================================================================
-// NSG recall/latency benchmark — "exams" dataset (flat file_hashes.json), TLSH
+// NSG recall/latency benchmark — "windows" dataset (directory tree), ssdeep
 // =============================================================================
 //
 // Overview
-//   Indexes a slice of TLSH hashes into the APOTHEOSIS / NSG model, runs a set
-//   of queries, and measures recall against a brute-force ground truth.
+//   Walks the windows-dataset tree, extracts ssdeep signatures, indexes a slice into
+//   the APOTHEOSIS / NSG model, queries it, and measures recall against a
+//   brute-force ground truth.
 //
 //   With --model-cache the built model is dumped to disk and reused on the next
 //   run that requests the same build config, replacing a rebuild with a load.
-//   This is what makes the ef-search sweep cheap: the first ef-search point
-//   builds and dumps the model; the remaining points load it.
+//   The first ef-search point of a config builds and dumps the model; the
+//   remaining points load it.
+//
+//   The engine matches the NSG test_ssdeep_exams binary; only the dataset reader
+//   differs. Here --dataset is a directory walked recursively for *.json files
+//   (a single JSON file is also accepted), and the reader tolerates both the
+//   flat-array layout and the keyed-object layout (see extract_from_value).
+//   --field falls back to "ssdeep_hash" when "ssdeep" is requested but absent.
 //
 // Cache integrity
 //   Each cache (model, brute, hash) has a companion "<file>.fp" sidecar holding
 //   a stable FNV-1a fingerprint of the data it was derived from:
 //     * model .fp  fingerprint of the indexed slice
 //     * brute .fp  fingerprint of (indexed slice, query slice)
-//     * hash  .fp  signature of the dataset file on disk (path, length, mtime)
+//     * hash  .fp  signature of every *.json file in the tree (path, length, mtime)
 //   The fingerprint is verified on load; a mismatch forces a rebuild or
 //   recompute rather than trusting a same-shaped but incorrect cache. A missing
-//   sidecar (for example, a cache written by an older build, or by the HNSW
-//   binary before it was updated) is accepted by shape, with a warning, and a
-//   sidecar is then written so subsequent runs are protected. The brute and hash
-//   caches are shared with the HNSW harness, so the HNSW binary must use the
-//   same fingerprint functions (see MIGRATION_NOTES) for the cross-tool sharing
-//   to remain safe.
+//   sidecar is accepted by shape, with a warning, and one is then written. The
+//   brute and hash caches are shared with the HNSW harness, so the HNSW binary
+//   must use the same fingerprint functions (see MIGRATION_NOTES) for the
+//   cross-tool sharing to remain safe.
 //
 // Timing
 //   The search is timed over --repeats passes (default 1) and the reported
-//   nsg_ms is the median, with an optional untimed --warmup pass. creation_ms
-//   and brute_ms are single measurements whose meaning depends on whether the
-//   cache was hit, so the RESULT line also carries model_cached and brute_cached
-//   flags (0/1) to distinguish "built" from "loaded". A derived qps column is
-//   emitted for convenience.
+//   nsg_ms is the median, with an optional untimed --warmup pass. The RESULT
+//   line carries model_cached and brute_cached flags (0/1) so that creation_ms
+//   and brute_ms can be read as either a build/compute time or a cache-load
+//   time, alongside a derived qps column.
 //
 // Harness interface
 //   The sweep harness (scripts/lib_nsg.sh) invokes this binary once per
@@ -41,13 +45,11 @@
 //     RESULT,init,iter,n_trees,leaf_size,M,C,EF,alpha,K,L,S,R,
 //            dataset_size,num_queries,search_k,ef_search,
 //            recall_at_k,exact_same,genuine_miss,creation_ms,brute_ms,nsg_ms,
-//            model_cached,brute_cached,repeats,qps
+//            model_cached,brute_cached,repeats,qps,incomparable
 //
 //   All other output is written to stderr. The RESULT columns and their order
-//   must stay in sync with the CSV header in lib_nsg.sh.
-//
-//   Column-name note: recall_at_k and genuine_miss are complementary (they sum
-//   to 1); exact_same (exact-item recall) is independent of both.
+//   must stay in sync with the CSV header in lib_nsg.sh, plus the trailing `incomparable` column the ssdeep wrapper appends (identical to the NSG
+//   exams binary).
 //
 // Parameter groups (all runtime flags; nothing is compile-time)
 //   build mode : --init {random|metric-tree}, --iter, --n-trees, --leaf-size
@@ -63,31 +65,50 @@
 //   search     : --search-k, --ef-search (omit to reuse the build --ef)
 //   timing     : --repeats (median over N passes), --warmup
 //   sampling   : --shuffle/--seed (representative sample), --dedup
-//   caching    : --hash-cache (skip JSON parse), --brute-cache, --model-cache, --rescan
+//   caching    : --hash-cache (skip the tree walk), --brute-cache, --model-cache, --rescan
 //
 // Recall definitions (mean over queries, each in [0, 1])
 //   distance-recall@k : fraction of returned items within the k-th true distance
 //                       (tie-tolerant).
 //   exact-item recall : additionally requires the returned point to be a true
-//                       top-k point (compared by hash bytes, so duplicates of
-//                       the right hash still count).
+//                       top-k point (compared by hash bytes).
 //
-// Help:  cargo run --release --bin test_tlsh_exams -- --help
+// Help:  cargo run --release --bin test_ssdeep_windows -- --help
 
 use apotheosis3::controllers::apotheosis::Apotheosis;
 use apotheosis3::controllers::nndescent::NndParams;
 use apotheosis3::controllers::nsg::{BuildConfig, NndInit, NsgParams};
-use apotheosis3::datalayer::algorithms::TlshDistance;
-use apotheosis3::datalayer::record::{ApotheosisRecord, SimpleTlshRecord};
+use apotheosis3::datalayer::algorithms::{DistanceAlgorithm, SsdeepDistance, SsdeepHash};
+use apotheosis3::datalayer::record::{ApotheosisRecord, SimpleSsdeepRecord};
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
-use std::path::Path;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use rayon::prelude::*;
-use tlsh2::TlshDefault;
+
+// ---------------------------------------------------------------------------
+// ssdeep glue. `ssdeep::compare` (libfuzzy) returns a 0..=100 *similarity*
+// (100 == identical); NSG wants a distance where smaller == closer, so
+// distance = 100 - similarity.
+//
+// CAVEAT: ssdeep returns 0 once block sizes differ by more than 2x -- that is
+// structural, whatever the content -- collapsing those pairs to the max
+// distance. On a corpus with a spread of file sizes that is most pairs, so
+// expect lower recall than TLSH, and read the `incomparable` column before
+// trusting recall_at_k.
+// ---------------------------------------------------------------------------
+
+type SsdeepRecord = SimpleSsdeepRecord;
+
+/// True when libfuzzy will accept `s` as a signature. Comparing a signature
+/// with itself succeeds exactly when it parses, so this asks libfuzzy instead
+/// of guessing at the format. The NUL check comes first because
+/// `ssdeep::compare` *panics*, rather than erroring, on an interior NUL byte.
+fn is_valid_ssdeep(s: &str) -> bool {
+    !s.bytes().any(|b| b == 0) && ssdeep::compare(s, s).is_ok()
+}
 
 // CLI-facing copy of NndInit so clap can derive a --init value parser; the
 // From impl below converts it into the controller's own enum.
@@ -107,16 +128,10 @@ impl From<InitArg> for NndInit {
 }
 
 // ---------------------------------------------------------------------------
-// Determinism and cache-integrity helpers.
-//   * SplitMix64  a fully specified PRNG that keeps --shuffle reproducible
-//                 across compilers, rand versions, and both the NSG and HNSW
-//                 crates.
-//   * FNV-1a      a stable content hash. std's DefaultHasher is not stable
-//                 across Rust versions and must not be used for a cross-build
-//                 cache key.
-//   * .fp sidecar every cache (model, brute, hash) has a companion <file>.fp
-//                 holding a hex fingerprint, verified on load; a mismatch is
-//                 refused.
+// Determinism and cache-integrity helpers, identical to the exams binary and
+// kept in sync with it. SplitMix64 is the stable PRNG for --shuffle; FNV-1a is
+// the stable content hash used for cache fingerprints; the .fp sidecars hold
+// those fingerprints.
 // ---------------------------------------------------------------------------
 
 struct SplitMix64(u64);
@@ -182,47 +197,29 @@ fn median(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Cheap dataset signature: path + length + mtime of the dataset file. Detects a
-/// regenerated dataset on disk (which would invalidate a hash cache) without
-/// re-reading the file. mtime-based, so it errs on the safe side: a touched file
-/// forces a rescan rather than risking a stale cache.
-fn dataset_signature(path: &str) -> u64 {
-    let mut h = FNV_OFFSET;
-    h = fnv1a64(path.as_bytes(), h);
-    if let Ok(md) = fs::metadata(path) {
-        h = fnv1a64(&md.len().to_le_bytes(), h);
-        if let Ok(t) = md.modified() {
-            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                h = fnv1a64(&d.as_secs().to_le_bytes(), h);
-            }
-        }
-    }
-    h
-}
-
-/// Benchmark APOTHEOSIS + NSG on a flat JSON array of TLSH hashes (file_hashes.json).
+/// Benchmark APOTHEOSIS + NSG on the windows-dataset ssdeep signatures.
 #[derive(Parser, Debug)]
-#[command(name = "test_tlsh", about = "Tune build modes/params and measure recall@k vs brute force (TLSH)")]
+#[command(name = "test_ssdeep_windows", about = "Tune build modes/params and measure recall@k vs brute force (ssdeep)")]
 struct Args {
-    /// Flat JSON file: an array of objects each with a TLSH field.
-    #[arg(long, default_value = "file_hashes.json")]
+    /// Dataset path. Either a directory (walked recursively for *.json) or a single JSON file.
+    #[arg(long, default_value = "windows-dataset")]
     dataset: String,
-    /// JSON field holding the TLSH hash in each object.
-    #[arg(long, default_value = "TLSH")]
+    /// JSON field holding the ssdeep signature inside each function object.
+    #[arg(long, default_value = "ssdeep")]
     field: String,
-    /// Drop duplicate hashes.
+    /// Drop duplicate hashes (function-level data has many identical hashes).
     #[arg(long, default_value_t = false)]
     dedup: bool,
     /// Shuffle the full hash list (seeded) before slicing dataset/queries, so the
     /// indexed set and queries are a representative sample rather than the first
-    /// records in file order.
+    /// directories in traversal order.
     #[arg(long, default_value_t = false)]
     shuffle: bool,
     /// RNG seed for --shuffle (fixed so runs are reproducible).
     #[arg(long, default_value_t = 42)]
     seed: u64,
     /// Number of dataset points to index (0 = use all available).
-    #[arg(long, default_value_t = 42000)]
+    #[arg(long, default_value_t = 100000)]
     dataset_size: usize,
     /// First query index (defaults to dataset_size, i.e. disjoint from the dataset).
     #[arg(long)]
@@ -249,11 +246,10 @@ struct Args {
     /// load it instead of building; otherwise build and write it here.
     #[arg(long)]
     model_cache: Option<String>,
-    /// Cache file for the extracted + validated hash list. Only used when given;
-    /// without it the dataset is always re-read (no auto-cache is written).
+    /// Cache file for the extracted + validated hash list (auto-derived if omitted).
     #[arg(long)]
     hash_cache: Option<String>,
-    /// Force a re-read of the dataset, ignoring any existing hash cache.
+    /// Force a re-scan of the dataset tree, ignoring any existing hash cache.
     #[arg(long, default_value_t = false)]
     rescan: bool,
 
@@ -302,39 +298,123 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// Dataset reading: pull the TLSH field out of the flat JSON (array, or a keyed
-// object) and keep only strings that parse as valid TLSH hashes.
+// Dataset reading: walk the tree for *.json, pull the ssdeep field (with a "ssdeep"
+// fallback) from either JSON layout, and keep only valid ssdeep signature strings.
 // ---------------------------------------------------------------------------
 
-fn push_field(obj: &Value, field: &str, out: &mut Vec<String>) {
-    if let Some(s) = obj.get(field).and_then(|x| x.as_str()) {
-        if !s.is_empty() && s != "TNULL" {
+/// Recursively collect every *.json file under `root` (or just `root` if it is a file).
+/// Sorted for deterministic dataset ordering.
+fn collect_json_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return out;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Cheap dataset signature over every *.json file in the tree: path + length +
+/// mtime, stat-only (no file reads). Detects a regenerated dataset on disk
+/// (which would invalidate a hash cache) far more cheaply than re-extracting.
+/// mtime-based, so it errs on the safe side: touched files force a rescan.
+fn dataset_signature(root: &Path) -> u64 {
+    let files = collect_json_files(root); // already sorted -> stable order
+    let mut h = FNV_OFFSET;
+    h = fnv1a64(&(files.len() as u64).to_le_bytes(), h);
+    for f in &files {
+        h = fnv1a64(f.to_string_lossy().as_bytes(), h);
+        if let Ok(md) = fs::metadata(f) {
+            h = fnv1a64(&md.len().to_le_bytes(), h);
+            if let Ok(t) = md.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    h = fnv1a64(&d.as_secs().to_le_bytes(), h);
+                }
+            }
+        }
+        h = fnv1a64(&[0xff], h);
+    }
+    h
+}
+
+/// Pull `field` (or `fallback`) out of a single JSON value if it looks like a hash string.
+fn push_field(obj: &Value, field: &str, fallback: Option<&str>, out: &mut Vec<String>) {
+    let val = obj
+        .get(field)
+        .and_then(|x| x.as_str())
+        .or_else(|| fallback.and_then(|f| obj.get(f)).and_then(|x| x.as_str()));
+    if let Some(s) = val {
+        if !s.is_empty() && s != "3::" {
             out.push(s.to_string());
         }
     }
 }
 
-fn read_hashes(path: &str, field: &str, dedup: bool) -> Vec<String> {
-    let data = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Failed to read JSON file {path}: {e}"));
-    let v: Value = serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse JSON {path}: {e}"));
-    let mut out = Vec::new();
-    match &v {
+/// Handle both shapes:
+///   * flat array `[ { "ssdeep": ... }, ... ]` (old `file_hashes.json` style)
+///   * keyed object `{ "file": "...", "fcn.x": { "ssdeep": ... }, ... }` (windows-dataset)
+fn extract_from_value(v: &Value, field: &str, fallback: Option<&str>, out: &mut Vec<String>) {
+    match v {
         Value::Array(arr) => {
             for item in arr {
-                push_field(item, field, &mut out);
+                push_field(item, field, fallback, out);
             }
         }
-        // Tolerate a keyed object too ({ name -> record }).
         Value::Object(map) => {
-            for val in map.values() {
-                push_field(val, field, &mut out);
+            if map.contains_key(field) || fallback.map_or(false, |f| map.contains_key(f)) {
+                // The object is itself a single record.
+                push_field(v, field, fallback, out);
+            } else {
+                // It is a map of {name -> record}; the "file" string value is skipped
+                // automatically because it has no `field`.
+                for val in map.values() {
+                    push_field(val, field, fallback, out);
+                }
             }
         }
         _ => {}
     }
-    out.retain(|s| TlshDefault::from_str(s).is_ok());
+}
+
+fn read_hashes(root: &Path, field: &str, dedup: bool) -> Vec<String> {
+    let files = collect_json_files(root);
+    eprintln!("Scanning {} JSON file(s) under {}", files.len(), root.display());
+    let mut out = Vec::new();
+    // "ssdeep" fallback keeps the old flat-array dataset working unchanged.
+    let fallback = if field == "ssdeep" { Some("ssdeep_hash") } else { None };
+    for f in &files {
+        let data = match fs::read_to_string(f) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Skipping {}: {e}", f.display());
+                continue;
+            }
+        };
+        extract_from_value(&v, field, fallback, &mut out);
+    }
+
+    // Keep only hashes the ssdeep parser actually accepts (avoids panics later).
+    out.retain(|s| is_valid_ssdeep(s));
+
     if dedup {
         let mut seen = HashSet::new();
         out.retain(|s| seen.insert(s.clone()));
@@ -345,19 +425,21 @@ fn read_hashes(path: &str, field: &str, dedup: bool) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Hash-list cache: active only when --hash-cache is given. In that case the
 // extracted and validated list is cached to that file so repeated runs skip the
-// JSON parse; --rescan bypasses a stale one. A "<cache>.fp" sidecar stores the
-// dataset signature, so a dataset regenerated on disk (same path) forces a
-// rescan even without --rescan. Without --hash-cache the dataset is always
-// re-read and no cache is written.
+// directory walk and JSON parse; --rescan bypasses a stale one. A "<cache>.fp"
+// sidecar stores the dataset signature, so a tree regenerated on disk forces a
+// rescan even without --rescan. Without --hash-cache the tree is always
+// re-scanned and no cache is written.
 // ---------------------------------------------------------------------------
 
+/// Load the extracted hash list from a flat newline-delimited cache (only when
+/// --hash-cache is set), or scan the dataset tree.
 fn load_or_scan_hashes(args: &Args) -> Vec<String> {
     let cache = match &args.hash_cache {
         Some(p) => p.clone(),
-        None => return read_hashes(&args.dataset, &args.field, args.dedup),
+        None => return read_hashes(Path::new(&args.dataset), &args.field, args.dedup),
     };
     let sig_path = format!("{cache}.fp");
-    let sig_now = dataset_signature(&args.dataset);
+    let sig_now = dataset_signature(Path::new(&args.dataset));
     if !args.rescan && Path::new(&cache).exists() {
         if let Ok(data) = fs::read_to_string(&cache) {
             let v: Vec<String> = data.lines().map(|l| l.to_string()).collect();
@@ -368,7 +450,7 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
                         return v;
                     }
                     Some(_) => {
-                        eprintln!("Hash cache {cache} is stale (dataset changed on disk) — rescanning");
+                        eprintln!("Hash cache {cache} is stale (dataset tree changed on disk) — rescanning");
                     }
                     None => {
                         eprintln!(
@@ -384,7 +466,7 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
             }
         }
     }
-    let v = read_hashes(&args.dataset, &args.field, args.dedup);
+    let v = read_hashes(Path::new(&args.dataset), &args.field, args.dedup);
     match fs::write(&cache, v.join("\n")) {
         Ok(_) => {
             eprintln!("Saved {} hashes to {cache}", v.len());
@@ -396,14 +478,14 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force ground truth: exact top-k per query, cached to disk so every
-// (build config, ef_search) point reuses it. Validated by a "<path>.fp" sidecar
-// holding the fingerprint of (dataset, queries), so a same-shaped but wrong
-// cache (different data, seed, or extraction order) can never be reused.
+// Brute-force ground truth: exact top-k per query, computed in parallel (rayon)
+// and cached to disk so every (build config, ef_search) point reuses it.
+// Validated by a "<path>.fp" sidecar holding the fingerprint of (dataset,
+// queries), so a same-shaped but wrong cache can never be reused.
 // ---------------------------------------------------------------------------
 
-fn create_tlsh_object(hash: &str) -> TlshDefault {
-    TlshDefault::from_str(hash).unwrap()
+fn create_ssdeep_object(hash: &str) -> SsdeepHash {
+    SsdeepHash(hash.to_string())
 }
 
 fn brute_cache_path(args: &Args, dataset_size: usize, qs: usize, qc: usize) -> String {
@@ -416,20 +498,20 @@ fn brute_cache_path(args: &Args, dataset_size: usize, qs: usize, qc: usize) -> S
         .unwrap_or("dataset");
     let dd = if args.dedup { "dedup" } else { "all" };
     let shuf = if args.shuffle { format!("shuf{}", args.seed) } else { "noshuf".to_string() };
-    format!(".brute_cache_tlsh_{base}_{dd}_{shuf}_{dataset_size}_{qs}_{qc}.json")
+    format!(".brute_cache_ssdeep_{base}_{dd}_{shuf}_{dataset_size}_{qs}_{qc}.json")
 }
 
 fn compute_brute(dataset: &[String], queries: &[String], k: usize) -> Vec<Vec<(u32, String)>> {
     // Parse all candidates in parallel (millions of hashes).
-    let cand_objs: Vec<TlshDefault> = dataset.par_iter().map(|s| create_tlsh_object(s)).collect();
+    let cand_objs: Vec<SsdeepHash> = dataset.par_iter().map(|s| create_ssdeep_object(s)).collect();
     queries
         .par_iter()
         .map(|q| {
-            let tq = create_tlsh_object(q);
+            let tq = create_ssdeep_object(q);
             // Max-heap of the k smallest (distance, index) pairs seen so far.
             let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
             for (i, c) in cand_objs.iter().enumerate() {
-                let d = tq.diff(c, true) as u32;
+                let d = SsdeepDistance.calculate_distance(&tq, c);
                 if heap.len() < k {
                     heap.push((d, i));
                 } else if let Some(&(worst, _)) = heap.peek() {
@@ -507,26 +589,34 @@ fn load_or_compute_brute(
 // ---------------------------------------------------------------------------
 // Model cache: load a previously dumped model if one exists at --model-cache and
 // its indexed count and fingerprint match; otherwise build it and dump it there
-// (with a "<path>.fp" sidecar). lib_nsg.sh keys the path on the build-config
-// slug and invalidates any dump older than the freshly compiled binary, so a
-// recompile triggers a rebuild.
+// (with a "<path>.fp" sidecar).
 // ---------------------------------------------------------------------------
 
 fn load_or_build_model(
     args: &Args,
     config: BuildConfig,
-    records: Vec<SimpleTlshRecord>,
+    records: Vec<SsdeepRecord>,
     expected_len: usize,
     fp: u64,
-) -> (Apotheosis<SimpleTlshRecord, TlshDistance>, bool) {
+) -> (Apotheosis<SsdeepRecord, SsdeepDistance>, bool) {
     if let Some(path) = &args.model_cache {
         if Path::new(path).exists() {
             let fp_path = format!("{path}.fp");
             let sidecar = read_fp(&fp_path);
-            match Apotheosis::<SimpleTlshRecord, TlshDistance>::load(path) {
-                Ok(m) if m.records.len() == expected_len => match sidecar {
+            match Apotheosis::<SsdeepRecord, SsdeepDistance>::load(path) {
+                // Apotheosis::insert dedups by radix key, so a model legitimately
+                // holds FEWER records than were handed to it — an exact record-count
+                // match is the wrong test and never succeeds on a corpus with
+                // duplicate hashes. The fingerprint is taken over the *input* slice
+                // and is unaffected by the dedup, so that is the check that matters;
+                // the count is only a shape sanity test for dumps written before the
+                // sidecar existed.
+                Ok(m) => match sidecar {
                     Some(s) if s == fp => {
-                        eprintln!("Loaded cached model ({} records, fp ok) from {path}", m.records.len());
+                        eprintln!(
+                            "Loaded cached model ({} unique records indexed from {expected_len}, fp ok) from {path}",
+                            m.records.len()
+                        );
                         return (m, true);
                     }
                     Some(_) => {
@@ -534,25 +624,26 @@ fn load_or_build_model(
                             "Ignoring cached model at {path}: fingerprint mismatch (data changed) — rebuilding"
                         );
                     }
-                    None => {
+                    None if !m.records.is_empty() && m.records.len() <= expected_len => {
                         eprintln!(
-                            "Cached model at {path} has no fingerprint sidecar; accepting by record \
-                             count and writing one (use --no-model-cache to force a rebuild if unsure)."
+                            "Cached model at {path} has no fingerprint sidecar; accepting by shape \
+                             and writing one (use --no-model-cache to force a rebuild if unsure)."
                         );
                         write_fp(&fp_path, fp);
                         return (m, true);
                     }
+                    None => eprintln!(
+                        "Ignoring cached model at {path}: no fingerprint sidecar, and {} records \
+                         is not a plausible subset of {expected_len}",
+                        m.records.len()
+                    ),
                 },
-                Ok(m) => eprintln!(
-                    "Ignoring cached model at {path}: {} records, expected {expected_len}",
-                    m.records.len()
-                ),
                 Err(e) => eprintln!("Ignoring unreadable cached model at {path}: {e}"),
             }
         }
     }
     eprintln!("Building APOTHEOSIS / NSG model...");
-    let mut apotheosis = Apotheosis::<SimpleTlshRecord, TlshDistance>::new(config);
+    let mut apotheosis = Apotheosis::<SsdeepRecord, SsdeepDistance>::new(config);
     apotheosis.insert(records);
     if let Some(path) = &args.model_cache {
         if let Some(parent) = Path::new(path).parent() {
@@ -572,8 +663,9 @@ fn load_or_build_model(
 }
 
 // ---------------------------------------------------------------------------
-// Entry point: assemble the build config, load + slice the data, build the NSG
-// index, compute/reuse ground truth, run the search, score recall, print RESULT.
+// Entry point: assemble the build config; load (from cache or by scanning),
+// optionally shuffle, and slice the data; build the NSG index; compute or reuse
+// the ground truth; run the search; score recall; print RESULT.
 // ---------------------------------------------------------------------------
 pub fn main() {
     let args = Args::parse();
@@ -610,7 +702,7 @@ pub fn main() {
         eprintln!("Shuffled {} hashes with seed {} (SplitMix64)", hashes.len(), args.seed);
     }
     let n_total = hashes.len();
-    eprintln!("Number of usable TLSH hashes: {n_total}");
+    eprintln!("Number of usable ssdeep signatures: {n_total}");
 
     let dataset_size = if args.dataset_size == 0 {
         n_total
@@ -619,7 +711,7 @@ pub fn main() {
     };
     let query_start = args.query_start.unwrap_or(dataset_size).min(n_total);
     let query_end = (query_start + args.query_count).min(n_total);
-    assert!(dataset_size > 0, "no usable TLSH hashes found in {}", args.dataset);
+    assert!(dataset_size > 0, "no usable ssdeep signatures found under {}", args.dataset);
 
     let dataset: Vec<String> = hashes[..dataset_size].to_vec();
     let queries: Vec<String> = hashes[query_start..query_end].to_vec();
@@ -662,14 +754,13 @@ pub fn main() {
     );
 
     // Content fingerprints for cache integrity (stable FNV-1a over the sliced
-    // hash strings). The model dump is keyed on the indexed slice; the brute
-    // truth on the indexed and query slices.
+    // hash strings).
     let model_fp = fingerprint_slices(&[dataset.as_slice()]);
     let brute_fp = fingerprint_slices(&[dataset.as_slice(), queries.as_slice()]);
 
-    let records: Vec<SimpleTlshRecord> = dataset
+    let records: Vec<SsdeepRecord> = dataset
         .iter()
-        .map(|s| SimpleTlshRecord::create(s.clone()))
+        .map(|s| SimpleSsdeepRecord::create(s.clone()))
         .collect();
 
     eprintln!("Preparing APOTHEOSIS / NSG model...");
@@ -681,6 +772,15 @@ pub fn main() {
     // carries no PRNG state, so without this a cached model would search with a
     // different stream than the one that just built it.
     apotheosis.set_seed(args.build_seed);
+    // insert() collapses records that share a radix key, so the graph is usually
+    // smaller than dataset_size. dataset_size in the RESULT line is the number of
+    // rows fed in, NOT the number of nodes in the index.
+    eprintln!(
+        "Indexed {} unique signatures from {} rows ({} collapsed as duplicates)",
+        apotheosis.records.len(),
+        dataset.len(),
+        dataset.len() - apotheosis.records.len()
+    );
 
     let cache = brute_cache_path(&args, dataset_size, query_start, args.query_count);
     let brute_start = Instant::now();
@@ -692,21 +792,20 @@ pub fn main() {
     eprintln!("Running APOTHEOSIS search (repeats={repeats}, warmup={})...", args.warmup);
     if args.warmup {
         for q in &queries {
-            let qh = TlshDefault::from_str(q).unwrap();
+            let qh = SsdeepHash(q.clone());
             let _ = apotheosis.search(&qh, args.search_k, args.ef_search);
         }
     }
     let mut nsg_times_ms: Vec<f64> = Vec::with_capacity(repeats);
-    // Approx top-k per query, kept from the first pass for scoring (the search is
-    // deterministic, so every pass yields the same result set).
+    // Approx top-k per query, kept from the first pass for scoring (deterministic).
     let mut approx: Vec<Vec<(u32, Vec<u8>)>> = Vec::new();
     for r in 0..repeats {
         let start = Instant::now();
         let mut pass: Vec<Vec<(u32, Vec<u8>)>> = Vec::with_capacity(queries.len());
         for q in &queries {
-            let qh = TlshDefault::from_str(q).unwrap();
+            let qh = SsdeepHash(q.clone());
             let res = apotheosis.search(&qh, args.search_k, args.ef_search);
-            pass.push(res.iter().take(k_eff).map(|&(d, rec)| (d, rec.search_id().hash().to_vec())).collect());
+            pass.push(res.iter().take(k_eff).map(|&(d, rec)| (d, rec.search_id().0.into_bytes())).collect());
         }
         nsg_times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         if r == 0 {
@@ -722,14 +821,23 @@ pub fn main() {
     let mut recall_sum = 0.0f64; // sum of per-query distance recall@k
     let mut exact_sum = 0.0f64;  // sum of per-query exact-item recall@k
     let mut counted = 0usize;    // queries that contributed (kk > 0)
+    // ssdeep-only: queries whose true k-th distance is already the maximum,
+    // i.e. the corpus holds nothing with a compatible block size. Distance
+    // recall is trivially 1.0 for these (everything returned is <= 100), so a
+    // high recall_at_k means little unless this count is small. Read
+    // exact_same instead when it is not.
+    let mut incomparable = 0usize;
     for (tlist, alist) in brute.iter().zip(approx.iter()) {
         let kk = k_eff.min(tlist.len());
         if kk == 0 {
             continue;
         }
         let true_kth = tlist[kk - 1].0;
+        if true_kth >= 100 {
+            incomparable += 1;
+        }
         let true_ids: HashSet<Vec<u8>> =
-            tlist[..kk].iter().map(|(_, h)| create_tlsh_object(h).hash().to_vec()).collect();
+            tlist[..kk].iter().map(|(_, h)| create_ssdeep_object(h).0.into_bytes()).collect();
         let mut found = 0usize;
         let mut exact = 0usize;
         for (d, h) in alist.iter() {
@@ -757,6 +865,12 @@ pub fn main() {
         args.search_k, counted, recall_at_k, 100.0 * recall_at_k
     );
     eprintln!("Exact-item recall@{}: {:.4}", args.search_k, exact_at_k);
+    eprintln!(
+        "Incomparable queries (no compatible block size anywhere in the corpus): {}/{} ({:.1}%)",
+        incomparable,
+        counted,
+        100.0 * incomparable as f64 / counted.max(1) as f64
+    );
     eprintln!("Miss rate@{}:         {:.4}", args.search_k, miss_at_k);
     eprintln!(
         "Creation time:    {:?} ({})",
@@ -773,11 +887,11 @@ pub fn main() {
         nsg_ms, repeats, qps
     );
 
-    // Machine-readable line for the sweep harness (stdout).
+    // Machine-readable line for the sweep harness (stdout). Columns identical to the NSG exams binary.
     println!(
         "RESULT,{init},{iter},{ntrees},{leaf},{m},{c},{ef},{alpha},{k},{l},{s},{r},\
          {dsize},{nq},{sk},{effef},{recall:.6},{exact:.6},{miss:.6},\
-         {cms:.3},{bms:.3},{nms:.3},{mc},{bc},{rep},{qps:.1}",
+         {cms:.3},{bms:.3},{nms:.3},{mc},{bc},{rep},{qps:.1},{incomp}",
         init = init_label,
         iter = config.iter,
         ntrees = config.n_trees,
@@ -804,5 +918,6 @@ pub fn main() {
         bc = brute_cached as u8,
         rep = repeats,
         qps = qps,
+        incomp = incomparable,
     );
 }

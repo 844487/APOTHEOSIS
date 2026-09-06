@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use tracing::debug;
 
-/// Runtime NN-descent sizes (see the comment on `Nhood`)
+// Runtime NN-descent sizes (see the comment on `Nhood`)
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NndParams {
     pub k: usize,
@@ -51,12 +51,16 @@ where
     D: DistanceAlgorithm<ID> + Default,
 {
     pub fn new(features: &'a [ID], params: NndParams) -> Self {
+        Self::new_with_seed(features, params, 42)
+    }
+
+    pub fn new_with_seed(features: &'a [ID], params: NndParams, seed: u64) -> Self {
         let n = features.len();
         Self {
             features,
             graph: Vec::with_capacity(n),
             distance: D::default(),
-            prng: StdRng::seed_from_u64(42),
+            prng: StdRng::seed_from_u64(seed),
             params,
         }
     }
@@ -64,6 +68,10 @@ where
     #[inline]
     fn random_node(&mut self) -> usize {
         let n = self.features.len();
+        if n == 0 {
+            return usize::MAX;
+        }
+
         self.prng.next_u64() as usize % n
     }
 
@@ -163,8 +171,6 @@ where
         }
     
         for node in 0..n {
-            // TODO: Pool is already sorted. Maybe do not insert at partition
-            // point and then sort here?
             // self.graph[node].pool.sort_unstable_by_key(|&(_, d, _)| d);
             self.graph[node].pool.truncate(L);
     
@@ -185,7 +191,6 @@ where
         let mut rnn_new_updates: Vec<(usize, usize)> = Vec::new();
         let mut rnn_old_updates: Vec<(usize, usize)> = Vec::new();
     
-        // TODO: Parallelise this 
         for node in 0..n {
             let m = self.graph[node].m;
             for l in 0..m {
@@ -234,8 +239,6 @@ where
             let mut rnn_new = std::mem::take(&mut self.graph[node].rnn_new);
             let mut rnn_old = std::mem::take(&mut self.graph[node].rnn_old);
     
-            // TODO: Shuffle rnn. This should not be reached (it is the same
-            // in the C++ code). Explore parallelisation.
             if rnn_new.len() > R {
                 debug!("update: rnn_new exceeded R={R}, shuffling");
                 for i in 0..R {
@@ -316,7 +319,6 @@ where
 }
 
 // VP-tree (metric-tree) initialisation
-// TODO: Check this
 #[allow(non_snake_case)]
 impl<'a, D, ID> NNDescent<'a, D, ID>
 where
@@ -453,3 +455,4 @@ where
         final_graph
     }
 }
+

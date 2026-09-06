@@ -1,9 +1,9 @@
 // =============================================================================
-// NSG recall/latency benchmark — "exams" dataset (flat file_hashes.json), TLSH
+// NSG recall/latency benchmark — "exams" dataset (flat file_hashes.json), ssdeep
 // =============================================================================
 //
 // Overview
-//   Indexes a slice of TLSH hashes into the APOTHEOSIS / NSG model, runs a set
+//   Indexes a slice of ssdeep signatures into the APOTHEOSIS / NSG model, runs a set
 //   of queries, and measures recall against a brute-force ground truth.
 //
 //   With --model-cache the built model is dumped to disk and reused on the next
@@ -41,10 +41,10 @@
 //     RESULT,init,iter,n_trees,leaf_size,M,C,EF,alpha,K,L,S,R,
 //            dataset_size,num_queries,search_k,ef_search,
 //            recall_at_k,exact_same,genuine_miss,creation_ms,brute_ms,nsg_ms,
-//            model_cached,brute_cached,repeats,qps
+//            model_cached,brute_cached,repeats,qps,incomparable
 //
 //   All other output is written to stderr. The RESULT columns and their order
-//   must stay in sync with the CSV header in lib_nsg.sh.
+//   must stay in sync with the CSV header in lib_nsg.sh, plus the trailing `incomparable` column the ssdeep wrapper appends.
 //
 //   Column-name note: recall_at_k and genuine_miss are complementary (they sum
 //   to 1); exact_same (exact-item recall) is independent of both.
@@ -72,22 +72,42 @@
 //                       top-k point (compared by hash bytes, so duplicates of
 //                       the right hash still count).
 //
-// Help:  cargo run --release --bin test_tlsh_exams -- --help
+// Help:  cargo run --release --bin test_ssdeep_exams -- --help
 
 use apotheosis3::controllers::apotheosis::Apotheosis;
 use apotheosis3::controllers::nndescent::NndParams;
 use apotheosis3::controllers::nsg::{BuildConfig, NndInit, NsgParams};
-use apotheosis3::datalayer::algorithms::TlshDistance;
-use apotheosis3::datalayer::record::{ApotheosisRecord, SimpleTlshRecord};
+use apotheosis3::datalayer::algorithms::{DistanceAlgorithm, SsdeepDistance, SsdeepHash};
+use apotheosis3::datalayer::record::{ApotheosisRecord, SimpleSsdeepRecord};
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Instant;
 use rayon::prelude::*;
-use tlsh2::TlshDefault;
+
+// ---------------------------------------------------------------------------
+// ssdeep glue. `ssdeep::compare` (libfuzzy) returns a 0..=100 *similarity*
+// (100 == identical); NSG wants a distance where smaller == closer, so
+// distance = 100 - similarity.
+//
+// CAVEAT: ssdeep returns 0 once block sizes differ by more than 2x -- that is
+// structural, whatever the content -- collapsing those pairs to the max
+// distance. On a corpus with a spread of file sizes that is most pairs, so
+// expect lower recall than TLSH, and read the `incomparable` column before
+// trusting recall_at_k.
+// ---------------------------------------------------------------------------
+
+type SsdeepRecord = SimpleSsdeepRecord;
+
+/// True when libfuzzy will accept `s` as a signature. Comparing a signature
+/// with itself succeeds exactly when it parses, so this asks libfuzzy instead
+/// of guessing at the format. The NUL check comes first because
+/// `ssdeep::compare` *panics*, rather than erroring, on an interior NUL byte.
+fn is_valid_ssdeep(s: &str) -> bool {
+    !s.bytes().any(|b| b == 0) && ssdeep::compare(s, s).is_ok()
+}
 
 // CLI-facing copy of NndInit so clap can derive a --init value parser; the
 // From impl below converts it into the controller's own enum.
@@ -200,15 +220,15 @@ fn dataset_signature(path: &str) -> u64 {
     h
 }
 
-/// Benchmark APOTHEOSIS + NSG on a flat JSON array of TLSH hashes (file_hashes.json).
+/// Benchmark APOTHEOSIS + NSG on a flat JSON array of ssdeep signatures (file_hashes.json).
 #[derive(Parser, Debug)]
-#[command(name = "test_tlsh", about = "Tune build modes/params and measure recall@k vs brute force (TLSH)")]
+#[command(name = "test_ssdeep_exams", about = "Tune build modes/params and measure recall@k vs brute force (ssdeep)")]
 struct Args {
-    /// Flat JSON file: an array of objects each with a TLSH field.
+    /// Flat JSON file: an array of objects each with an ssdeep field.
     #[arg(long, default_value = "file_hashes.json")]
     dataset: String,
-    /// JSON field holding the TLSH hash in each object.
-    #[arg(long, default_value = "TLSH")]
+    /// JSON field holding the ssdeep signature in each object.
+    #[arg(long, default_value = "ssdeep")]
     field: String,
     /// Drop duplicate hashes.
     #[arg(long, default_value_t = false)]
@@ -302,13 +322,13 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// Dataset reading: pull the TLSH field out of the flat JSON (array, or a keyed
-// object) and keep only strings that parse as valid TLSH hashes.
+// Dataset reading: pull the ssdeep field out of the flat JSON (array, or a keyed
+// object) and keep only strings that parse as valid ssdeep signatures.
 // ---------------------------------------------------------------------------
 
 fn push_field(obj: &Value, field: &str, out: &mut Vec<String>) {
     if let Some(s) = obj.get(field).and_then(|x| x.as_str()) {
-        if !s.is_empty() && s != "TNULL" {
+        if !s.is_empty() && s != "3::" {
             out.push(s.to_string());
         }
     }
@@ -334,7 +354,7 @@ fn read_hashes(path: &str, field: &str, dedup: bool) -> Vec<String> {
         }
         _ => {}
     }
-    out.retain(|s| TlshDefault::from_str(s).is_ok());
+    out.retain(|s| is_valid_ssdeep(s));
     if dedup {
         let mut seen = HashSet::new();
         out.retain(|s| seen.insert(s.clone()));
@@ -402,8 +422,8 @@ fn load_or_scan_hashes(args: &Args) -> Vec<String> {
 // cache (different data, seed, or extraction order) can never be reused.
 // ---------------------------------------------------------------------------
 
-fn create_tlsh_object(hash: &str) -> TlshDefault {
-    TlshDefault::from_str(hash).unwrap()
+fn create_ssdeep_object(hash: &str) -> SsdeepHash {
+    SsdeepHash(hash.to_string())
 }
 
 fn brute_cache_path(args: &Args, dataset_size: usize, qs: usize, qc: usize) -> String {
@@ -416,20 +436,20 @@ fn brute_cache_path(args: &Args, dataset_size: usize, qs: usize, qc: usize) -> S
         .unwrap_or("dataset");
     let dd = if args.dedup { "dedup" } else { "all" };
     let shuf = if args.shuffle { format!("shuf{}", args.seed) } else { "noshuf".to_string() };
-    format!(".brute_cache_tlsh_{base}_{dd}_{shuf}_{dataset_size}_{qs}_{qc}.json")
+    format!(".brute_cache_ssdeep_{base}_{dd}_{shuf}_{dataset_size}_{qs}_{qc}.json")
 }
 
 fn compute_brute(dataset: &[String], queries: &[String], k: usize) -> Vec<Vec<(u32, String)>> {
     // Parse all candidates in parallel (millions of hashes).
-    let cand_objs: Vec<TlshDefault> = dataset.par_iter().map(|s| create_tlsh_object(s)).collect();
+    let cand_objs: Vec<SsdeepHash> = dataset.par_iter().map(|s| create_ssdeep_object(s)).collect();
     queries
         .par_iter()
         .map(|q| {
-            let tq = create_tlsh_object(q);
+            let tq = create_ssdeep_object(q);
             // Max-heap of the k smallest (distance, index) pairs seen so far.
             let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
             for (i, c) in cand_objs.iter().enumerate() {
-                let d = tq.diff(c, true) as u32;
+                let d = SsdeepDistance.calculate_distance(&tq, c);
                 if heap.len() < k {
                     heap.push((d, i));
                 } else if let Some(&(worst, _)) = heap.peek() {
@@ -515,18 +535,28 @@ fn load_or_compute_brute(
 fn load_or_build_model(
     args: &Args,
     config: BuildConfig,
-    records: Vec<SimpleTlshRecord>,
+    records: Vec<SsdeepRecord>,
     expected_len: usize,
     fp: u64,
-) -> (Apotheosis<SimpleTlshRecord, TlshDistance>, bool) {
+) -> (Apotheosis<SsdeepRecord, SsdeepDistance>, bool) {
     if let Some(path) = &args.model_cache {
         if Path::new(path).exists() {
             let fp_path = format!("{path}.fp");
             let sidecar = read_fp(&fp_path);
-            match Apotheosis::<SimpleTlshRecord, TlshDistance>::load(path) {
-                Ok(m) if m.records.len() == expected_len => match sidecar {
+            match Apotheosis::<SsdeepRecord, SsdeepDistance>::load(path) {
+                // Apotheosis::insert dedups by radix key, so a model legitimately
+                // holds FEWER records than were handed to it — an exact record-count
+                // match is the wrong test and never succeeds on a corpus with
+                // duplicate hashes. The fingerprint is taken over the *input* slice
+                // and is unaffected by the dedup, so that is the check that matters;
+                // the count is only a shape sanity test for dumps written before the
+                // sidecar existed.
+                Ok(m) => match sidecar {
                     Some(s) if s == fp => {
-                        eprintln!("Loaded cached model ({} records, fp ok) from {path}", m.records.len());
+                        eprintln!(
+                            "Loaded cached model ({} unique records indexed from {expected_len}, fp ok) from {path}",
+                            m.records.len()
+                        );
                         return (m, true);
                     }
                     Some(_) => {
@@ -534,25 +564,26 @@ fn load_or_build_model(
                             "Ignoring cached model at {path}: fingerprint mismatch (data changed) — rebuilding"
                         );
                     }
-                    None => {
+                    None if !m.records.is_empty() && m.records.len() <= expected_len => {
                         eprintln!(
-                            "Cached model at {path} has no fingerprint sidecar; accepting by record \
-                             count and writing one (use --no-model-cache to force a rebuild if unsure)."
+                            "Cached model at {path} has no fingerprint sidecar; accepting by shape \
+                             and writing one (use --no-model-cache to force a rebuild if unsure)."
                         );
                         write_fp(&fp_path, fp);
                         return (m, true);
                     }
+                    None => eprintln!(
+                        "Ignoring cached model at {path}: no fingerprint sidecar, and {} records \
+                         is not a plausible subset of {expected_len}",
+                        m.records.len()
+                    ),
                 },
-                Ok(m) => eprintln!(
-                    "Ignoring cached model at {path}: {} records, expected {expected_len}",
-                    m.records.len()
-                ),
                 Err(e) => eprintln!("Ignoring unreadable cached model at {path}: {e}"),
             }
         }
     }
     eprintln!("Building APOTHEOSIS / NSG model...");
-    let mut apotheosis = Apotheosis::<SimpleTlshRecord, TlshDistance>::new(config);
+    let mut apotheosis = Apotheosis::<SsdeepRecord, SsdeepDistance>::new(config);
     apotheosis.insert(records);
     if let Some(path) = &args.model_cache {
         if let Some(parent) = Path::new(path).parent() {
@@ -610,7 +641,7 @@ pub fn main() {
         eprintln!("Shuffled {} hashes with seed {} (SplitMix64)", hashes.len(), args.seed);
     }
     let n_total = hashes.len();
-    eprintln!("Number of usable TLSH hashes: {n_total}");
+    eprintln!("Number of usable ssdeep signatures: {n_total}");
 
     let dataset_size = if args.dataset_size == 0 {
         n_total
@@ -619,7 +650,7 @@ pub fn main() {
     };
     let query_start = args.query_start.unwrap_or(dataset_size).min(n_total);
     let query_end = (query_start + args.query_count).min(n_total);
-    assert!(dataset_size > 0, "no usable TLSH hashes found in {}", args.dataset);
+    assert!(dataset_size > 0, "no usable ssdeep signatures found in {}", args.dataset);
 
     let dataset: Vec<String> = hashes[..dataset_size].to_vec();
     let queries: Vec<String> = hashes[query_start..query_end].to_vec();
@@ -667,9 +698,9 @@ pub fn main() {
     let model_fp = fingerprint_slices(&[dataset.as_slice()]);
     let brute_fp = fingerprint_slices(&[dataset.as_slice(), queries.as_slice()]);
 
-    let records: Vec<SimpleTlshRecord> = dataset
+    let records: Vec<SsdeepRecord> = dataset
         .iter()
-        .map(|s| SimpleTlshRecord::create(s.clone()))
+        .map(|s| SimpleSsdeepRecord::create(s.clone()))
         .collect();
 
     eprintln!("Preparing APOTHEOSIS / NSG model...");
@@ -681,6 +712,15 @@ pub fn main() {
     // carries no PRNG state, so without this a cached model would search with a
     // different stream than the one that just built it.
     apotheosis.set_seed(args.build_seed);
+    // insert() collapses records that share a radix key, so the graph is usually
+    // smaller than dataset_size. dataset_size in the RESULT line is the number of
+    // rows fed in, NOT the number of nodes in the index.
+    eprintln!(
+        "Indexed {} unique signatures from {} rows ({} collapsed as duplicates)",
+        apotheosis.records.len(),
+        dataset.len(),
+        dataset.len() - apotheosis.records.len()
+    );
 
     let cache = brute_cache_path(&args, dataset_size, query_start, args.query_count);
     let brute_start = Instant::now();
@@ -692,7 +732,7 @@ pub fn main() {
     eprintln!("Running APOTHEOSIS search (repeats={repeats}, warmup={})...", args.warmup);
     if args.warmup {
         for q in &queries {
-            let qh = TlshDefault::from_str(q).unwrap();
+            let qh = SsdeepHash(q.clone());
             let _ = apotheosis.search(&qh, args.search_k, args.ef_search);
         }
     }
@@ -704,9 +744,9 @@ pub fn main() {
         let start = Instant::now();
         let mut pass: Vec<Vec<(u32, Vec<u8>)>> = Vec::with_capacity(queries.len());
         for q in &queries {
-            let qh = TlshDefault::from_str(q).unwrap();
+            let qh = SsdeepHash(q.clone());
             let res = apotheosis.search(&qh, args.search_k, args.ef_search);
-            pass.push(res.iter().take(k_eff).map(|&(d, rec)| (d, rec.search_id().hash().to_vec())).collect());
+            pass.push(res.iter().take(k_eff).map(|&(d, rec)| (d, rec.search_id().0.into_bytes())).collect());
         }
         nsg_times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         if r == 0 {
@@ -722,14 +762,23 @@ pub fn main() {
     let mut recall_sum = 0.0f64; // sum of per-query distance recall@k
     let mut exact_sum = 0.0f64;  // sum of per-query exact-item recall@k
     let mut counted = 0usize;    // queries that contributed (kk > 0)
+    // ssdeep-only: queries whose true k-th distance is already the maximum,
+    // i.e. the corpus holds nothing with a compatible block size. Distance
+    // recall is trivially 1.0 for these (everything returned is <= 100), so a
+    // high recall_at_k means little unless this count is small. Read
+    // exact_same instead when it is not.
+    let mut incomparable = 0usize;
     for (tlist, alist) in brute.iter().zip(approx.iter()) {
         let kk = k_eff.min(tlist.len());
         if kk == 0 {
             continue;
         }
         let true_kth = tlist[kk - 1].0;
+        if true_kth >= 100 {
+            incomparable += 1;
+        }
         let true_ids: HashSet<Vec<u8>> =
-            tlist[..kk].iter().map(|(_, h)| create_tlsh_object(h).hash().to_vec()).collect();
+            tlist[..kk].iter().map(|(_, h)| create_ssdeep_object(h).0.into_bytes()).collect();
         let mut found = 0usize;
         let mut exact = 0usize;
         for (d, h) in alist.iter() {
@@ -757,6 +806,12 @@ pub fn main() {
         args.search_k, counted, recall_at_k, 100.0 * recall_at_k
     );
     eprintln!("Exact-item recall@{}: {:.4}", args.search_k, exact_at_k);
+    eprintln!(
+        "Incomparable queries (no compatible block size anywhere in the corpus): {}/{} ({:.1}%)",
+        incomparable,
+        counted,
+        100.0 * incomparable as f64 / counted.max(1) as f64
+    );
     eprintln!("Miss rate@{}:         {:.4}", args.search_k, miss_at_k);
     eprintln!(
         "Creation time:    {:?} ({})",
@@ -777,7 +832,7 @@ pub fn main() {
     println!(
         "RESULT,{init},{iter},{ntrees},{leaf},{m},{c},{ef},{alpha},{k},{l},{s},{r},\
          {dsize},{nq},{sk},{effef},{recall:.6},{exact:.6},{miss:.6},\
-         {cms:.3},{bms:.3},{nms:.3},{mc},{bc},{rep},{qps:.1}",
+         {cms:.3},{bms:.3},{nms:.3},{mc},{bc},{rep},{qps:.1},{incomp}",
         init = init_label,
         iter = config.iter,
         ntrees = config.n_trees,
@@ -804,5 +859,6 @@ pub fn main() {
         bc = brute_cached as u8,
         rep = repeats,
         qps = qps,
+        incomp = incomparable,
     );
 }
